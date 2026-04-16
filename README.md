@@ -191,8 +191,6 @@ profiles:
 
 ## Architecture
 
-The codebase is designed for extensibility (TUI planned):
-
 ```
 cmd/              CLI layer (cobra) — thin, delegates to daemon
 internal/
@@ -200,15 +198,12 @@ internal/
   state/          Service state machine with transition validation
   reconnect/      Exponential backoff calculator
   ip/             Deterministic loopback IP allocator (FNV hash)
-  dns/            /etc/hosts manager (legacy, not used in default mode)
   resolver/       Embedded DNS server + engine adapter
   session/        SSM session lifecycle (start, wait, stop)
   proxy/          TCP proxy + sigv4 signing reverse proxy
   engine/         Orchestrator: state machines, events, reconnect loops
   daemon/         Unix socket server/client, PID lock, lifecycle
 ```
-
-The engine emits events on a Go channel. The CLI prints them as log lines. A future TUI subscribes to the same channel for a live dashboard — no engine changes needed.
 
 ## License
 
