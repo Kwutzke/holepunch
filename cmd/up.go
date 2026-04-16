@@ -40,7 +40,7 @@ func runUp(_ *cobra.Command, args []string) error {
 	// Warn if config changed since last setup.
 	if config.SetupStale(configPath) {
 		fmt.Println("Warning: config has changed since last setup.")
-		fmt.Println("Run 'holepunch restart' and 'sudo holepunch setup' to apply changes.")
+		fmt.Println("Run 'sudo holepunch setup' then 'holepunch restart' to apply changes.")
 		fmt.Println()
 	}
 
