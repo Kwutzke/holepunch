@@ -6,9 +6,9 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/Kwutzke/holepunch/internal/config"
 	"github.com/Kwutzke/holepunch/internal/daemon"
+	"github.com/spf13/cobra"
 )
 
 var upCmd = &cobra.Command{
@@ -35,6 +35,13 @@ func runUp(_ *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return fmt.Errorf("no profiles defined in config")
 		}
+	}
+
+	// Warn if config changed since last setup.
+	if config.SetupStale(configPath) {
+		fmt.Println("Warning: config has changed since last setup.")
+		fmt.Println("Run 'holepunch restart' and 'sudo holepunch setup' to apply changes.")
+		fmt.Println()
 	}
 
 	client := daemon.NewClient(socketPath)
