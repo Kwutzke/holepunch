@@ -3,18 +3,20 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"github.com/Kwutzke/holepunch/internal/config"
 	"github.com/Kwutzke/holepunch/internal/dns"
 	"github.com/Kwutzke/holepunch/internal/engine"
 	enginemocks "github.com/Kwutzke/holepunch/internal/engine/mocks"
+	"github.com/Kwutzke/holepunch/internal/session"
 	sessionmocks "github.com/Kwutzke/holepunch/internal/session/mocks"
 	"github.com/Kwutzke/holepunch/internal/state"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
 
@@ -398,6 +400,118 @@ func TestStartMultipleServices(t *testing.T) {
 
 	close(done1)
 	close(done2)
+}
+
+func TestStartSingleServiceByTarget(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctrl := gomock.NewController(t)
+
+	mockDNS := enginemocks.NewMockDNSManager(ctrl)
+	mockSessions := enginemocks.NewMockSessionManager(ctrl)
+	mockIPs := enginemocks.NewMockIPAllocator(ctrl)
+	mockProxies := setupMockProxy(ctrl)
+
+	ip2 := net.IPv4(127, 0, 0, 2)
+	// Only opensearch should be allocated — rds stays untouched.
+	mockIPs.EXPECT().Allocate("dev/opensearch").Return(ip2, nil).AnyTimes()
+	mockDNS.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+	sess := sessionmocks.NewMockSession(ctrl)
+	done := make(chan struct{})
+	sess.EXPECT().Wait().DoAndReturn(func() error { <-done; return nil })
+	mockSessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(sess, nil).Times(1)
+
+	eng := engine.New(testConfigMultiService(), mockDNS, mockSessions, mockIPs, mockProxies)
+
+	require.NoError(t, eng.Start(ctx, []string{"dev/opensearch"}))
+
+	_, ok := waitForState(eng.Events(), state.Connected, 3*time.Second)
+	require.True(t, ok, "opensearch should connect")
+
+	// Only one instance exists — rds was not started.
+	statuses := eng.Status()
+	require.Len(t, statuses, 1)
+	assert.Equal(t, "opensearch", statuses[0].ServiceName)
+
+	close(done)
+}
+
+func TestStartUnknownService(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctrl := gomock.NewController(t)
+
+	mockDNS := enginemocks.NewMockDNSManager(ctrl)
+	mockSessions := enginemocks.NewMockSessionManager(ctrl)
+	mockIPs := enginemocks.NewMockIPAllocator(ctrl)
+	mockProxies := setupMockProxy(ctrl)
+
+	eng := engine.New(testConfigMultiService(), mockDNS, mockSessions, mockIPs, mockProxies)
+
+	err := eng.Start(ctx, []string{"dev/nonexistent"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown service")
+}
+
+func TestCredentialsExpiredHaltsReconnect(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctrl := gomock.NewController(t)
+
+	mockDNS := enginemocks.NewMockDNSManager(ctrl)
+	mockSessions := enginemocks.NewMockSessionManager(ctrl)
+	mockIPs := enginemocks.NewMockIPAllocator(ctrl)
+	mockProxies := setupMockProxy(ctrl)
+
+	mockIPs.EXPECT().Allocate("dev/opensearch").Return(testIP, nil).AnyTimes()
+	mockDNS.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	expiredErr := fmt.Errorf("%w: The SSO session associated with this profile has expired", session.ErrCredentialsExpired)
+
+	sess := sessionmocks.NewMockSession(ctrl)
+	sess.EXPECT().Wait().Return(expiredErr)
+	// Assert Start is called exactly once — halt must prevent a second attempt.
+	mockSessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(sess, nil).Times(1)
+
+	eng := engine.New(testConfig(), mockDNS, mockSessions, mockIPs, mockProxies)
+
+	require.NoError(t, eng.Start(ctx, []string{"dev"}))
+
+	events := eng.Events()
+
+	sc, found := waitForState(events, state.Failed, 3*time.Second)
+	require.True(t, found, "expected Failed state after expired credentials")
+	assert.Equal(t, "dev", sc.Profile)
+	assert.Equal(t, "opensearch", sc.ServiceName)
+	assert.True(t, errors.Is(sc.Error, session.ErrCredentialsExpired))
+
+	var gotCredsEvent bool
+	deadline := time.After(500 * time.Millisecond)
+collect:
+	for {
+		select {
+		case evt := <-events:
+			if ce, ok := evt.(engine.CredentialsExpired); ok {
+				assert.Equal(t, "dev", ce.Profile)
+				assert.Equal(t, "dev-sso", ce.AWSProfile)
+				assert.Equal(t, "opensearch", ce.ServiceName)
+				assert.NotEmpty(t, ce.Detail)
+				gotCredsEvent = true
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+	assert.True(t, gotCredsEvent, "expected CredentialsExpired event")
+
+	// Confirm no retry occurred: status still Failed after a grace period
+	// (shorter than the reconnect backoff InitialDelay of 1s — if the
+	// goroutine didn't halt we'd see Starting again).
+	time.Sleep(1500 * time.Millisecond)
+	statuses := eng.Status()
+	require.Len(t, statuses, 1)
+	assert.Equal(t, state.Failed, statuses[0].State)
 }
 
 func TestMatchesProfile(t *testing.T) {

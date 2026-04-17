@@ -6,15 +6,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/Kwutzke/holepunch/internal/daemon"
+	"github.com/spf13/cobra"
 )
 
 var forceKill bool
 
 var downCmd = &cobra.Command{
-	Use:   "down [profile...]",
-	Short: "Stop port forwarding for the given profiles, or stop all and kill daemon",
+	Use:   "down [target...]",
+	Short: "Stop targets (profile or profile/service), or stop all and kill daemon",
 	RunE:  runDown,
 }
 
@@ -43,8 +43,8 @@ func runDown(_ *cobra.Command, args []string) error {
 
 	// Stop the requested profiles (or all).
 	resp, err := client.SendCommand(daemon.Request{
-		Command:  daemon.CmdDown,
-		Profiles: args,
+		Command: daemon.CmdDown,
+		Targets: args,
 	})
 	if err != nil {
 		return err
@@ -54,7 +54,7 @@ func runDown(_ *cobra.Command, args []string) error {
 	}
 
 	if len(args) > 0 {
-		fmt.Printf("Stopped profiles: %v\n", args)
+		fmt.Printf("Stopped: %v\n", args)
 		return nil
 	}
 

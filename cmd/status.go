@@ -5,8 +5,8 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/spf13/cobra"
 	"github.com/Kwutzke/holepunch/internal/daemon"
+	"github.com/spf13/cobra"
 )
 
 var statusCmd = &cobra.Command{
@@ -36,7 +36,7 @@ func runStatus(_ *cobra.Command, _ []string) error {
 	}
 
 	if len(resp.Statuses) == 0 {
-		fmt.Println("No active services.")
+		fmt.Println("No services configured.")
 		return nil
 	}
 

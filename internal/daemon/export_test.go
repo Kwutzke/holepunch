@@ -11,3 +11,10 @@ func ExportedWriteMessage(conn net.Conn, msg any) error {
 func ExportedReadMessage(conn net.Conn, msg any) error {
 	return readMessage(conn, msg)
 }
+
+// HasTrayClient reports whether the server currently has any tray
+// registrations — used in tests to verify the counter increments/decrements
+// around CmdTrayRegister connections.
+func (s *Server) HasTrayClient() bool {
+	return s.hasTrayClient.Load() > 0
+}

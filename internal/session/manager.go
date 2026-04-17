@@ -3,12 +3,18 @@ package session
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"syscall"
 	"time"
 )
+
+// stderrCaptureSize bounds the ring buffer holding recent aws-cli stderr.
+// 8 KiB keeps the full SSO-token error text (typically <2 KiB) without
+// risking unbounded memory growth on a noisy child.
+const stderrCaptureSize = 8 * 1024
 
 // StartParams contains the parameters for starting an SSM port-forwarding session.
 type StartParams struct {
@@ -54,13 +60,15 @@ func (m *SSMManager) Start(ctx context.Context, params StartParams) (Session, er
 	args := buildSSMArgs(params)
 	cmd := m.cmdFactory(ctx, "aws", args...)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	stderrBuf := newRingBuffer(stderrCaptureSize)
+	cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting SSM session: %w", err)
 	}
 
-	return &ssmSession{cmd: cmd}, nil
+	return &ssmSession{cmd: cmd, stderr: stderrBuf}, nil
 }
 
 // BuildSSMArgs constructs the AWS CLI arguments for an SSM port-forwarding session.
@@ -93,7 +101,8 @@ func buildSSMArgs(params StartParams) []string {
 }
 
 type ssmSession struct {
-	cmd *exec.Cmd
+	cmd    *exec.Cmd
+	stderr *ringBuffer
 }
 
 func (s *ssmSession) PID() int {
@@ -104,7 +113,18 @@ func (s *ssmSession) PID() int {
 }
 
 func (s *ssmSession) Wait() error {
-	return s.cmd.Wait()
+	err := s.cmd.Wait()
+	if err == nil {
+		return nil
+	}
+	if s.stderr != nil && matchesCredentialsExpired(s.stderr.Bytes()) {
+		snippet := expiredSnippet(s.stderr.Bytes())
+		if snippet == "" {
+			return fmt.Errorf("%w: %v", ErrCredentialsExpired, err)
+		}
+		return fmt.Errorf("%w: %s", ErrCredentialsExpired, snippet)
+	}
+	return err
 }
 
 func (s *ssmSession) Stop(ctx context.Context) error {

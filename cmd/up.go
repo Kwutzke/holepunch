@@ -12,9 +12,12 @@ import (
 )
 
 var upCmd = &cobra.Command{
-	Use:   "up [profile...]",
-	Short: "Start port forwarding for the given profiles (or all)",
-	RunE:  runUp,
+	Use:   "up [target...]",
+	Short: "Start port forwarding for the given targets (profile or profile/service), or all",
+	Long: "Start port forwarding. Each target is either a profile name (starts all " +
+		"services in that profile) or \"profile/service\" (starts just that service). " +
+		"With no targets, starts every profile in the config.",
+	RunE: runUp,
 }
 
 func init() {
@@ -51,8 +54,8 @@ func runUp(_ *cobra.Command, args []string) error {
 	}
 
 	resp, err := client.SendCommand(daemon.Request{
-		Command:  daemon.CmdUp,
-		Profiles: args,
+		Command: daemon.CmdUp,
+		Targets: args,
 	})
 	if err != nil {
 		return err
@@ -61,7 +64,7 @@ func runUp(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("daemon error: %s", resp.Error)
 	}
 
-	fmt.Printf("Started profiles: %v\n", args)
+	fmt.Printf("Started: %v\n", args)
 	fmt.Println("Use 'holepunch status' to check service states.")
 	return nil
 }

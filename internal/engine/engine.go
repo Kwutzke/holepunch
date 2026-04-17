@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,59 +119,120 @@ func (e *Engine) emitStateChange(si *serviceInstance, from, to state.ServiceStat
 	})
 }
 
-// Start begins port-forwarding for the specified profiles.
-// It is additive — calling Start with new profiles adds them alongside existing ones.
-func (e *Engine) Start(ctx context.Context, profiles []string) error {
-	for _, profileName := range profiles {
+// Config returns a snapshot of the engine's config. Used by the daemon's
+// status handler to merge configured-but-not-running services into the
+// response so UIs can render a complete service inventory.
+func (e *Engine) Config() config.Config {
+	return e.cfg
+}
+
+// target identifies a single configured service.
+type target struct {
+	profile string
+	service config.Service
+}
+
+// resolveTargets expands selector strings into concrete configured
+// services. Each selector is either "profile" (expands to every service
+// in the profile) or "profile/service" (a single service). Returns an
+// error for unknown profiles or services.
+func (e *Engine) resolveTargets(selectors []string) ([]target, error) {
+	var out []target
+	for _, sel := range selectors {
+		profileName, serviceName, hasService := strings.Cut(sel, "/")
 		profile, ok := e.cfg.Profiles[profileName]
 		if !ok {
-			return fmt.Errorf("unknown profile: %q", profileName)
+			return nil, fmt.Errorf("unknown profile: %q", profileName)
+		}
+		if !hasService {
+			for _, svc := range profile.Services {
+				out = append(out, target{profile: profileName, service: svc})
+			}
+			continue
+		}
+		var match *config.Service
+		for i := range profile.Services {
+			if profile.Services[i].Name == serviceName {
+				match = &profile.Services[i]
+				break
+			}
+		}
+		if match == nil {
+			return nil, fmt.Errorf("unknown service: %q", sel)
+		}
+		out = append(out, target{profile: profileName, service: *match})
+	}
+	return out, nil
+}
+
+// Start begins port-forwarding for the specified selectors. Each selector
+// is either "profile" (all services) or "profile/service" (just that one).
+// It is additive — calling Start with new selectors adds them alongside
+// existing ones.
+func (e *Engine) Start(ctx context.Context, selectors []string) error {
+	targets, err := e.resolveTargets(selectors)
+	if err != nil {
+		return err
+	}
+	for _, t := range targets {
+		profile := e.cfg.Profiles[t.profile]
+		key := t.profile + "/" + t.service.Name
+
+		e.mu.RLock()
+		_, exists := e.instances[key]
+		e.mu.RUnlock()
+		if exists {
+			e.emitLog("warn", "already running, skipping", t.profile, t.service.Name)
+			continue
 		}
 
-		for _, svc := range profile.Services {
-			key := profileName + "/" + svc.Name
-
-			e.mu.RLock()
-			_, exists := e.instances[key]
-			e.mu.RUnlock()
-			if exists {
-				e.emitLog("warn", "already running, skipping", profileName, svc.Name)
-				continue
-			}
-
-			ip, err := e.ips.Allocate(key)
-			if err != nil {
-				return fmt.Errorf("allocating IP for %s: %w", key, err)
-			}
-
-			si := &serviceInstance{
-				profile: profileName,
-				service: svc,
-				state:   state.Disconnected,
-				backoff: reconnect.NewBackoff(),
-				localIP: ip.String(),
-			}
-
-			e.mu.Lock()
-			e.instances[key] = si
-			e.mu.Unlock()
-
-			svcCtx, cancel := context.WithCancel(ctx)
-			si.cancel = cancel
-
-			go e.runService(svcCtx, si, profile)
+		ip, err := e.ips.Allocate(key)
+		if err != nil {
+			return fmt.Errorf("allocating IP for %s: %w", key, err)
 		}
+
+		si := &serviceInstance{
+			profile: t.profile,
+			service: t.service,
+			state:   state.Disconnected,
+			backoff: reconnect.NewBackoff(),
+			localIP: ip.String(),
+		}
+
+		e.mu.Lock()
+		e.instances[key] = si
+		e.mu.Unlock()
+
+		svcCtx, cancel := context.WithCancel(ctx)
+		si.cancel = cancel
+
+		go e.runService(svcCtx, si, profile)
 	}
 	return nil
 }
 
-// Stop stops port-forwarding for the specified profiles.
-// If no profiles are given, all running profiles are stopped.
-func (e *Engine) Stop(ctx context.Context, profiles []string) error {
+// Stop stops port-forwarding for the specified selectors. Each selector
+// is either "profile" (all services in profile) or "profile/service"
+// (just that one). If no selectors are given, all running services are
+// stopped.
+func (e *Engine) Stop(ctx context.Context, selectors []string) error {
+	// Build the set of keys to stop. For an empty selector list, all
+	// running instances are targeted.
+	wantKey := make(map[string]bool)
+	if len(selectors) > 0 {
+		targets, err := e.resolveTargets(selectors)
+		if err != nil {
+			return err
+		}
+		for _, t := range targets {
+			wantKey[t.profile+"/"+t.service.Name] = true
+		}
+	}
+
 	e.mu.RLock()
 	toStop := make([]*serviceInstance, 0)
 	for key, si := range e.instances {
-		if len(profiles) == 0 || matchesProfile(key, profiles) {
+		if len(selectors) == 0 || wantKey[key] {
 			toStop = append(toStop, si)
 		}
 	}
@@ -207,18 +270,14 @@ func (e *Engine) Stop(ctx context.Context, profiles []string) error {
 		}
 	}
 
-	// Emit ProfileDone for each profile that has no more instances.
+	// Emit ProfileDone for each profile whose last instance just went away.
 	doneProfiles := make(map[string]bool)
 	for _, si := range toStop {
 		doneProfiles[si.profile] = true
 	}
 	e.mu.RLock()
-	for key := range e.instances {
-		for p := range doneProfiles {
-			if matchesProfile(key, []string{p}) {
-				delete(doneProfiles, p)
-			}
-		}
+	for _, si := range e.instances {
+		delete(doneProfiles, si.profile)
 	}
 	e.mu.RUnlock()
 	for p := range doneProfiles {
@@ -372,6 +431,22 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 		}
 		e.emitStateChange(si, state.Connected, state.Reconnecting, waitErr)
 
+		// Halt on expired credentials — reconnecting burns cycles against a
+		// dead token. User must `aws sso login` and trigger a restart.
+		if errors.Is(waitErr, session.ErrCredentialsExpired) {
+			_ = si.transition(state.Failed)
+			e.emitStateChange(si, state.Reconnecting, state.Failed, waitErr)
+			e.emit(CredentialsExpired{
+				Profile:     si.profile,
+				AWSProfile:  profile.AWSProfile,
+				ServiceName: si.service.Name,
+				Detail:      waitErr.Error(),
+				Timestamp:   time.Now(),
+			})
+			e.emitLog("error", fmt.Sprintf("credentials expired for aws profile %q — run: aws sso login --profile %s", profile.AWSProfile, profile.AWSProfile), si.profile, si.service.Name)
+			return
+		}
+
 		// Check if connection was stable enough to reset backoff.
 		if si.backoff.ShouldReset() {
 			si.backoff.Reset()
@@ -427,15 +502,6 @@ func (e *Engine) stopService(ctx context.Context, si *serviceInstance) {
 
 	_ = si.transition(state.Disconnected)
 	e.emitStateChange(si, state.Stopping, state.Disconnected, nil)
-}
-
-func matchesProfile(key string, profiles []string) bool {
-	for _, p := range profiles {
-		if len(key) > len(p) && key[:len(p)+1] == p+"/" {
-			return true
-		}
-	}
-	return false
 }
 
 // freePort asks the OS for an available port on 127.0.0.1.

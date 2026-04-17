@@ -10,14 +10,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"github.com/Kwutzke/holepunch/internal/config"
 	"github.com/Kwutzke/holepunch/internal/daemon"
 	"github.com/Kwutzke/holepunch/internal/dns"
 	"github.com/Kwutzke/holepunch/internal/engine"
 	"github.com/Kwutzke/holepunch/internal/ip"
 	"github.com/Kwutzke/holepunch/internal/session"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // fakeProxyFactory implements engine.ProxyFactory with no-op proxies.
@@ -154,7 +154,10 @@ func TestServerClientRoundTrip(t *testing.T) {
 		resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdStatus})
 		require.NoError(t, err)
 		assert.True(t, resp.OK)
-		assert.Empty(t, resp.Statuses)
+		// Status now includes configured-but-not-running services so UIs
+		// can render the full inventory. testCfg has one service.
+		require.Len(t, resp.Statuses, 1)
+		assert.Equal(t, "Disconnected", resp.Statuses[0].State)
 	})
 
 	t.Run("up then status", func(t *testing.T) {
@@ -162,7 +165,7 @@ func TestServerClientRoundTrip(t *testing.T) {
 		socketPath, _ := startTestServer(t)
 		client := daemon.NewClient(socketPath)
 
-		resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdUp, Profiles: []string{"dev"}})
+		resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdUp, Targets: []string{"dev"}})
 		require.NoError(t, err)
 		assert.True(t, resp.OK, "up response error: %s", resp.Error)
 
@@ -183,20 +186,23 @@ func TestServerClientRoundTrip(t *testing.T) {
 		socketPath, _ := startTestServer(t)
 		client := daemon.NewClient(socketPath)
 
-		resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdUp, Profiles: []string{"dev"}})
+		resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdUp, Targets: []string{"dev"}})
 		require.NoError(t, err)
 		assert.True(t, resp.OK)
 
 		time.Sleep(100 * time.Millisecond)
 
-		resp, err = client.SendCommand(daemon.Request{Command: daemon.CmdDown, Profiles: []string{"dev"}})
+		resp, err = client.SendCommand(daemon.Request{Command: daemon.CmdDown, Targets: []string{"dev"}})
 		require.NoError(t, err)
 		assert.True(t, resp.OK)
 
 		resp, err = client.SendCommand(daemon.Request{Command: daemon.CmdStatus})
 		require.NoError(t, err)
 		assert.True(t, resp.OK)
-		assert.Empty(t, resp.Statuses)
+		// After Down, services drop back to Disconnected but remain in
+		// the response (configured-but-not-running).
+		require.Len(t, resp.Statuses, 1)
+		assert.Equal(t, "Disconnected", resp.Statuses[0].State)
 	})
 
 	t.Run("unknown command", func(t *testing.T) {
@@ -215,7 +221,7 @@ func TestServerClientRoundTrip(t *testing.T) {
 		socketPath, _ := startTestServer(t)
 		client := daemon.NewClient(socketPath)
 
-		resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdUp, Profiles: []string{"nonexistent"}})
+		resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdUp, Targets: []string{"nonexistent"}})
 		require.NoError(t, err)
 		assert.False(t, resp.OK)
 		assert.Contains(t, resp.Error, "unknown profile")
@@ -264,11 +270,11 @@ func TestProtocolReadWrite(t *testing.T) {
 		if err := readTestMessage(conn, &req); err != nil {
 			return
 		}
-		writeTestMessage(conn, daemon.Response{OK: true, Statuses: []daemon.StatusEntry{{Profile: req.Profiles[0]}}})
+		_ = writeTestMessage(conn, daemon.Response{OK: true, Statuses: []daemon.StatusEntry{{Profile: req.Targets[0]}}})
 	}()
 
 	client := daemon.NewClient(socketPath)
-	resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdStatus, Profiles: []string{"test-profile"}})
+	resp, err := client.SendCommand(daemon.Request{Command: daemon.CmdStatus, Targets: []string{"test-profile"}})
 	require.NoError(t, err)
 	assert.True(t, resp.OK)
 	require.Len(t, resp.Statuses, 1)

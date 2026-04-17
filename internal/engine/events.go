@@ -43,3 +43,18 @@ type ProfileDone struct {
 }
 
 func (ProfileDone) eventMarker() {}
+
+// CredentialsExpired is emitted when a service halts because the underlying
+// AWS credentials are no longer valid. The engine transitions the service to
+// Failed and stops its reconnect goroutine — the user must refresh
+// credentials (typically via `aws sso login --profile <AWSProfile>`) and
+// trigger a restart.
+type CredentialsExpired struct {
+	Profile     string
+	AWSProfile  string
+	ServiceName string
+	Detail      string
+	Timestamp   time.Time
+}
+
+func (CredentialsExpired) eventMarker() {}
