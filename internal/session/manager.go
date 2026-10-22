@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,9 @@ type Manager interface {
 // 8 KiB keeps the full SSO-token error text (typically <2 KiB) without
 // risking unbounded memory growth on a noisy child.
 const stderrCaptureSize = 8 * 1024
+
+// groupGrace is how long a session's process group gets to exit after SIGTERM before SIGKILL.
+const groupGrace = 2 * time.Second
 
 // StartParams contains the parameters for starting an SSM port-forwarding session.
 type StartParams struct {
@@ -64,32 +68,82 @@ func (m *SSMManager) Start(ctx context.Context, params StartParams) (Session, er
 	stderrBuf := newRingBuffer(stderrCaptureSize)
 	cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
 
+	// aws leads its own process group, so session-manager-plugin can be signalled with it.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Pgid = 0
+
+	s := &ssmSession{cmd: cmd, stderr: stderrBuf, done: make(chan struct{})}
+	cmd.Cancel = func() error { return s.signalGroup(syscall.SIGTERM) }
+	cmd.WaitDelay = groupGrace
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting SSM session: %w", err)
 	}
+	go s.wait()
 
-	return &ssmSession{cmd: cmd, stderr: stderrBuf}, nil
+	return s, nil
 }
 
 type ssmSession struct {
 	cmd    *exec.Cmd
 	stderr *ringBuffer
+
+	done chan struct{}
+	err  error // set before done closes
 }
 
 func (s *ssmSession) PID() int {
-	if s.cmd.Process == nil {
-		return 0
-	}
 	return s.cmd.Process.Pid
 }
 
 func (s *ssmSession) Wait() error {
+	<-s.done
+	return s.err
+}
+
+func (s *ssmSession) Stop(ctx context.Context) error {
+	// Once the group is gone its ID may be reused, so it must not be signalled.
+	select {
+	case <-s.done:
+		return nil
+	default:
+	}
+
+	if err := s.signalGroup(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("sending SIGTERM: %w", err)
+	}
+
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+	}
+
+	if err := s.signalGroup(syscall.SIGKILL); err != nil {
+		return fmt.Errorf("sending SIGKILL: %w", err)
+	}
+	select {
+	case <-s.done:
+	case <-time.After(groupGrace):
+	}
+	return ctx.Err()
+}
+
+// wait is the only caller of cmd.Wait. The session ends only once its whole process group is
+// gone, so a plugin that outlives aws is terminated with it.
+func (s *ssmSession) wait() {
 	err := s.cmd.Wait()
+	s.terminateGroup()
+	s.err = s.classify(err)
+	close(s.done)
+}
+
+func (s *ssmSession) classify(err error) error {
 	if err == nil {
 		return nil
-	}
-	if s.stderr == nil {
-		return err
 	}
 	stderrBytes := s.stderr.Bytes()
 	if matchesCredentialsExpired(stderrBytes) {
@@ -101,43 +155,33 @@ func (s *ssmSession) Wait() error {
 	return err
 }
 
-func (s *ssmSession) Stop(ctx context.Context) error {
-	if s.cmd.Process == nil {
+// terminateGroup sends SIGTERM to what is left of the process group, then SIGKILL once groupGrace
+// passes with a member still alive.
+func (s *ssmSession) terminateGroup() {
+	if err := s.signalGroup(syscall.SIGTERM); err != nil || !s.groupAlive() {
+		return
+	}
+	deadline := time.Now().Add(groupGrace)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		if !s.groupAlive() {
+			return
+		}
+	}
+	_ = s.signalGroup(syscall.SIGKILL)
+}
+
+func (s *ssmSession) groupAlive() bool {
+	return syscall.Kill(-s.cmd.Process.Pid, 0) == nil
+}
+
+// signalGroup treats a group with no members left as success.
+func (s *ssmSession) signalGroup(sig syscall.Signal) error {
+	err := syscall.Kill(-s.cmd.Process.Pid, sig)
+	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
-
-	// Send SIGTERM first for graceful shutdown.
-	if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		// Process might already be dead.
-		if !isProcessFinished(err) {
-			return fmt.Errorf("sending SIGTERM: %w", err)
-		}
-		return nil
-	}
-
-	// Wait for process to exit or context to cancel.
-	done := make(chan error, 1)
-	go func() {
-		done <- s.cmd.Wait()
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		// Context cancelled, force kill.
-		if err := s.cmd.Process.Signal(syscall.SIGKILL); err != nil && !isProcessFinished(err) {
-			return fmt.Errorf("sending SIGKILL: %w", err)
-		}
-		// Wait briefly for the kill to take effect.
-		killCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		select {
-		case <-done:
-		case <-killCtx.Done():
-		}
-		return ctx.Err()
-	}
+	return err
 }
 
 // BuildSSMArgs constructs the AWS CLI arguments for an SSM port-forwarding session.
@@ -174,8 +218,4 @@ func wrapSessionErr(sentinel error, snippet string, cause error) error {
 		return fmt.Errorf("%w: %v", sentinel, cause)
 	}
 	return fmt.Errorf("%w: %s", sentinel, snippet)
-}
-
-func isProcessFinished(err error) bool {
-	return err != nil && err.Error() == "os: process already finished"
 }
