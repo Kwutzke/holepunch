@@ -1,0 +1,57 @@
+# Hand-edited, never via `roborev config set --local`: that rewrites the whole file as marshaller
+# output and destroys every comment in it.
+#
+# These review_guidelines APPEND to the global prompt. Leaving review_guidelines_supersede_global
+# unset keeps the global's intent check, failure-scenario requirement and refutation pass.
+
+# docs/werkbank/** is scaffolding. `/finish` deletes the design and plan once what they taught has
+# been converted, so a review of them is spent on text that is about to stop existing.
+exclude_patterns = ['docs/werkbank/**']
+
+review_guidelines = """
+## What this repository is
+
+A macOS/Linux daemon that keeps SSM port-forwarding tunnels to AWS services open. Each configured
+service gets a loopback IP, a DNS name served by the daemon's own resolver, a local TCP (or sigv4
+signing) proxy, and an `aws ssm start-session` child that spawns `session-manager-plugin`. The
+engine runs one loop per service through a state machine (Disconnected, Starting, Connected,
+Reconnecting, Failed, Stopping). A CLI and a tray app talk to the daemon over a unix socket.
+
+## Weight these highest
+
+  - **A tunnel that looks Connected and carries nothing.** The plugin keeps its local listener open
+    after its AWS connection dies, so process liveness is not tunnel liveness. Weight any change that
+    treats "the child is running" as "the service works", or that removes a path by which a dead
+    session gets noticed and replaced.
+  - **A child process that outlives its session.** `aws` spawns the plugin; signalling only `aws`
+    orphans the plugin to PID 1 for good. Weight any start, stop or cancel path that does not reach
+    the whole process group.
+  - **A failure that ends a service loop without the user being told why.** A loop that returns
+    leaves the service stuck until a manual restart. Only expired credentials are meant to stop it.
+  - **A state transition the machine rejects, with the error ignored.** `_ = si.transition(...)`
+    hides an illegal edge, and the service then sits in a state nobody can leave.
+  - **Blocking under a lock.** Status and Down RPCs take the per-service lock; a proxy Stop or a
+    session Wait held under it freezes the CLI and the tray.
+  - **Production reach.** The daemon forwards to production with whatever the user's AWS profile
+    grants. Weight anything that widens what it does there beyond forwarding bytes and signing
+    requests for the configured services.
+  - **A test that passes for a reason other than the one it names.** A fake session that never
+    exits, a timeout that lets an assertion pass by not running, an event counted on a channel that
+    drops events when full.
+
+## Do not report
+
+  - That holepunch should probe tunnels end to end. Rejected: the services share no protocol a
+    generic probe could speak, and the plugin accepts local dials even when dead.
+  - That orphaned plugins should be swept at daemon start. Rejected: it would kill sessions the
+    user started by hand.
+  - That sleep or network detection should use native OS notifications. Rejected: that needs cgo
+    and has no Linux equivalent.
+  - Absent comments. The default is none.
+"""
+
+[kata_context]
+# Commits carry `Kata: holepunch#<id>`. The referenced issue is the authoritative statement of what
+# the change was meant to do; without this the reviewer falls back to the commit subject, which it
+# treats as untrusted.
+mode = "current"
