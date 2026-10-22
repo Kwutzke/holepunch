@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -21,6 +22,9 @@ var expiredPatterns = []string{
 	"ExpiredTokenException",
 	"the security token included in the request is expired",
 	"Your short-term credentials have expired",
+	// aws-sdk-go-v2 ssocreds, met by the bastion lookup rather than by aws.
+	"the SSO session has expired or is invalid",
+	"cached SSO token is expired",
 }
 
 // targetNotConnectedPatterns lists stderr substrings that identify the
@@ -28,6 +32,15 @@ var expiredPatterns = []string{
 // signal; the message wording ("i-xxx is not connected") is the common form.
 var targetNotConnectedPatterns = []string{
 	"TargetNotConnected",
+}
+
+// ClassifyCredentials wraps err with ErrCredentialsExpired when its text shows expired
+// credentials, whichever AWS client produced it, and returns any other err unchanged.
+func ClassifyCredentials(err error) error {
+	if err == nil || errors.Is(err, ErrCredentialsExpired) || !matchesCredentialsExpired([]byte(err.Error())) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrCredentialsExpired, err)
 }
 
 // matchesCredentialsExpired reports whether the given stderr bytes contain any

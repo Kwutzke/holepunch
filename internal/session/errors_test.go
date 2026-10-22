@@ -23,6 +23,8 @@ func Test_matchesCredentialsExpired(t *testing.T) {
 		{"sts expired token", "An error occurred (ExpiredTokenException) when calling the StartSession operation", true},
 		{"security token expired", "the security token included in the request is expired", true},
 		{"short-term creds", "Your short-term credentials have expired. Please refresh.", true},
+		{"sdk sso session", "failed to refresh cached credentials, the SSO session has expired or is invalid", true},
+		{"sdk cached sso token", "cached SSO token is expired, or not present, and cannot be refreshed", true},
 		{"case insensitive", "error loading sso token: token has expired", true},
 		{"pattern mid-stream", strings.Repeat("noise\n", 50) + "ExpiredTokenException\n" + strings.Repeat("noise\n", 50), true},
 	}

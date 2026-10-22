@@ -16,9 +16,12 @@ import (
 	"time"
 
 	"github.com/Kwutzke/holepunch/internal/config"
+	"github.com/Kwutzke/holepunch/internal/daemon"
 	"github.com/Kwutzke/holepunch/internal/dns"
 	"github.com/Kwutzke/holepunch/internal/engine"
 	enginemocks "github.com/Kwutzke/holepunch/internal/engine/mocks"
+	"github.com/Kwutzke/holepunch/internal/netwatch"
+	"github.com/Kwutzke/holepunch/internal/resolver"
 	"github.com/Kwutzke/holepunch/internal/session"
 	sessionmocks "github.com/Kwutzke/holepunch/internal/session/mocks"
 	"github.com/Kwutzke/holepunch/internal/state"
@@ -589,6 +592,42 @@ func TestEngine_runService(t *testing.T) {
 		assert.Equal(t, []string{"reconnecting in 1s (attempt 1)", "reconnecting in 1s (attempt 2)"}, delays, "uncapped, the second delay is 2s")
 	})
 
+	t.Run("down while a session is starting leaves nothing running", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+
+		m := newStartMocks(ctrl)
+		m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil)
+		m.dns.EXPECT().RemoveEntries(gomock.Any(), gomock.Any()).Return(nil)
+		m.ips.EXPECT().Release("dev/opensearch")
+		m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("i-0abc123", nil)
+
+		lateSession := sessionmocks.NewMockSession(ctrl)
+		lateSession.EXPECT().Stop(gomock.Any()).Return(nil)
+		lateProxy := enginemocks.NewMockTCPProxy(ctrl)
+		lateProxy.EXPECT().Stop()
+		m.proxies.EXPECT().NewProxy(gomock.Any(), gomock.Any()).Return(lateProxy, nil).MaxTimes(1)
+
+		starting, stopped := awaitCalled(t), make(chan struct{})
+		m.sessions.EXPECT().Start(gomock.Any(), gomock.Any()).DoAndReturn(func(context.Context, session.StartParams) (session.Session, error) {
+			close(starting)
+			<-stopped
+			return lateSession, nil
+		})
+
+		eng := engine.New(testConfig(), m.dns, m.sessions, m.bastion, m.ips, m.proxies)
+		require.NoError(t, eng.Start(t.Context(), []string{"dev"}))
+		<-starting
+		require.NoError(t, eng.Stop(t.Context(), []string{"dev"}))
+		_, found := waitForState(eng.Events(), state.Disconnected, 2*time.Second)
+		require.True(t, found, "expected Disconnected after down")
+		close(stopped)
+
+		sc, found := waitForState(eng.Events(), state.Connected, 500*time.Millisecond)
+		assert.False(t, found, "a stopped service reported %v -> Connected", sc.From)
+		assert.Empty(t, eng.Status(), "the stopped service is gone")
+	})
+
 	t.Run("down while retrying a failed start ends in Disconnected", func(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
@@ -635,6 +674,55 @@ func TestEngine_runService(t *testing.T) {
 		sc, found := waitForState(eng.Events(), state.Disconnected, 2*time.Second)
 		require.True(t, found, "expected Disconnected after down")
 		assert.Equal(t, state.Stopping, sc.From)
+	})
+
+	t.Run("expired credentials during a start stop at Failed and emit the event", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			err  error
+		}{
+			{"sdk api error", errors.New(`describing asg "bastion-asg": operation error Auto Scaling: DescribeAutoScalingGroups, https response error StatusCode: 403, RequestID: 1, api error ExpiredToken: The security token included in the request is expired`)},
+			{"sso session expired", errors.New("bastion: building aws clients for profile \"dev-sso\": failed to refresh cached credentials, the SSO session has expired or is invalid")},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				ctrl := gomock.NewController(t)
+
+				m := newStartMocks(ctrl)
+				m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil)
+				m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("", tt.err).Times(1)
+
+				eng := engine.New(testConfig(), m.dns, m.sessions, m.bastion, m.ips, m.proxies)
+				require.NoError(t, eng.Start(t.Context(), []string{"dev"}))
+
+				var failed *engine.ServiceStateChanged
+				var expired *engine.CredentialsExpired
+				deadline := time.After(3 * time.Second)
+				for failed == nil || expired == nil {
+					select {
+					case evt := <-eng.Events():
+						switch e := evt.(type) {
+						case engine.ServiceStateChanged:
+							require.NotEqual(t, state.Reconnecting, e.To, "expired credentials must not retry: %v", e.Error)
+							if e.To == state.Failed {
+								failed = &e
+							}
+						case engine.CredentialsExpired:
+							expired = &e
+						}
+					case <-deadline:
+						t.Fatalf("no Failed with CredentialsExpired; failed=%v expired=%v", failed, expired)
+					}
+				}
+				assert.Equal(t, state.Starting, failed.From)
+				assert.ErrorIs(t, failed.Error, session.ErrCredentialsExpired)
+				assert.Equal(t, "dev-sso", expired.AWSProfile)
+			})
+		}
 	})
 
 	t.Run("credentials expired halts reconnect", func(t *testing.T) {
@@ -839,7 +927,7 @@ func TestEngine_DropSessions(t *testing.T) {
 		collectConnected(t, eng.Events(), 2, 5*time.Second)
 		oldGroups := standIns.pids(t, 2)
 
-		eng.DropSessions(ctx, "test network event")
+		sendNetworkEvent(t, eng, "local addresses changed from [192.168.68.60] to [172.20.10.11]")
 
 		collectConnected(t, eng.Events(), 2, 10*time.Second)
 		assert.EqualValues(t, 4, standIns.started.Load(), "a second session per service")
@@ -874,10 +962,7 @@ func TestEngine_DropSessions(t *testing.T) {
 		collectConnected(t, eng.Events(), 2, 5*time.Second)
 		oldGroups := standIns.pids(t, 2)
 
-		eng.DropSessions(ctx, "host resumed from sleep (10m0s since the last check)")
-		for _, pid := range oldGroups {
-			assert.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "process %d of a dropped session is alive", pid)
-		}
+		sendNetworkEvent(t, eng, "host resumed from sleep (10m0s since the last check)")
 
 		changes := collectConnected(t, eng.Events(), 2, 15*time.Second)
 		var failedStarts int
@@ -888,6 +973,9 @@ func TestEngine_DropSessions(t *testing.T) {
 			}
 		}
 		assert.Equal(t, 2, failedStarts, "both failing lookups retried")
+		for _, pid := range oldGroups {
+			assert.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "process %d of a dropped session is alive", pid)
+		}
 		assert.EqualValues(t, 4, standIns.started.Load(), "the failed lookups started no session")
 
 		allGroups := standIns.pids(t, 4)
@@ -984,6 +1072,17 @@ func testConfigMultiService() config.Config {
 			},
 		},
 	}
+}
+
+// sendNetworkEvent delivers one event as the daemon does: from a watcher's channel through a
+// NetworkFollower to eng.
+func sendNetworkEvent(t *testing.T, eng *engine.Engine, reason string) {
+	t.Helper()
+	noUpstream := func() ([]string, error) { return nil, nil }
+	follower := daemon.NewNetworkFollower(eng, resolver.New("127.0.0.1:0"), noUpstream)
+	events := make(chan netwatch.Event)
+	go follower.Follow(t.Context(), events)
+	events <- netwatch.Event{Reason: reason, Time: time.Now()}
 }
 
 // collectConnected returns the state changes up to the n-th move to Connected.

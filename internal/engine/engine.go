@@ -309,6 +309,9 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 			if ctx.Err() != nil {
 				return
 			}
+			if e.credentialsExpired(si, state.Starting, session.ClassifyCredentials(err), profile) {
+				return
+			}
 			if !e.reconnecting(si, state.Starting, err) {
 				return
 			}
@@ -334,18 +337,7 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 				return
 			}
 
-			// No retry can succeed until the user runs `aws sso login` and restarts the service.
-			if errors.Is(waitErr, session.ErrCredentialsExpired) {
-				_ = si.transition(state.Failed)
-				e.emitStateChange(si, state.Reconnecting, state.Failed, waitErr)
-				e.emit(CredentialsExpired{
-					Profile:     si.profile,
-					AWSProfile:  profile.AWSProfile,
-					ServiceName: si.service.Name,
-					Detail:      waitErr.Error(),
-					Timestamp:   time.Now(),
-				})
-				e.emitLog("error", fmt.Sprintf("credentials expired for aws profile %q — run: aws sso login --profile %s", profile.AWSProfile, profile.AWSProfile), si.profile, si.service.Name)
+			if e.credentialsExpired(si, state.Reconnecting, waitErr, profile) {
 				return
 			}
 
@@ -406,8 +398,24 @@ func (e *Engine) connect(ctx context.Context, si *serviceInstance, profile confi
 	if err != nil {
 		return nil, err
 	}
+	var tcpProxy TCPProxy
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if tcpProxy != nil {
+			tcpProxy.Stop()
+		}
+		// ctx may be cancelled already; the session still has to be stopped.
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if stopErr := sess.Stop(stopCtx); stopErr != nil {
+			e.emitLog("warn", fmt.Sprintf("error stopping session: %v", stopErr), si.profile, si.service.Name)
+		}
+	}()
 
-	tcpProxy, err := e.proxies.NewProxy(ctx, ProxyConfig{
+	tcpProxy, err = e.proxies.NewProxy(ctx, ProxyConfig{
 		ListenAddr:   fmt.Sprintf("%s:%d", ip.String(), si.service.LocalPort),
 		TargetAddr:   fmt.Sprintf("127.0.0.1:%d", ssmPort),
 		Sigv4Service: si.service.Sigv4Service,
@@ -416,28 +424,59 @@ func (e *Engine) connect(ctx context.Context, si *serviceInstance, profile confi
 		AWSRegion:    profile.AWSRegion,
 	})
 	if err != nil {
-		stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if stopErr := sess.Stop(stopCtx); stopErr != nil {
-			e.emitLog("warn", fmt.Sprintf("error stopping session: %v", stopErr), si.profile, si.service.Name)
-		}
+		tcpProxy = nil
 		return nil, fmt.Errorf("starting proxy: %w", err)
 	}
 
+	// stopService cancels ctx before it reads si.session, so checking ctx under si.mu means either
+	// stopService sees this session or this commit sees the stop.
 	si.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		si.mu.Unlock()
+		return nil, err
+	}
+	if err := state.Transition(si.state, state.Connected); err != nil {
+		si.mu.Unlock()
+		return nil, err
+	}
+	si.state = state.Connected
 	si.session = sess
 	si.tcpProxy = tcpProxy
 	si.lastError = nil
-	si.mu.Unlock()
-
-	_ = si.transition(state.Connected)
-	si.mu.Lock()
 	si.connectedAt = time.Now()
 	si.mu.Unlock()
+	committed = true
+
 	si.backoff.MarkConnected()
 	e.emitStateChange(si, state.Starting, state.Connected, nil)
 	e.emitLog("info", fmt.Sprintf("connected via %s:%d (ssm port %d)", si.localIP, si.service.LocalPort, ssmPort), si.profile, si.service.Name)
 	return sess, nil
+}
+
+// credentialsExpired moves the service to Failed and emits CredentialsExpired when err wraps
+// session.ErrCredentialsExpired: no retry can succeed until the user runs `aws sso login` and
+// restarts the service.
+func (e *Engine) credentialsExpired(si *serviceInstance, from state.ServiceState, err error, profile config.Profile) bool {
+	if !errors.Is(err, session.ErrCredentialsExpired) {
+		return false
+	}
+	si.mu.Lock()
+	si.lastError = err
+	si.mu.Unlock()
+	if terr := si.transition(state.Failed); terr != nil {
+		e.emitLog("error", fmt.Sprintf("cannot transition to Failed: %v", terr), si.profile, si.service.Name)
+		return true
+	}
+	e.emitStateChange(si, from, state.Failed, err)
+	e.emit(CredentialsExpired{
+		Profile:     si.profile,
+		AWSProfile:  profile.AWSProfile,
+		ServiceName: si.service.Name,
+		Detail:      err.Error(),
+		Timestamp:   time.Now(),
+	})
+	e.emitLog("error", fmt.Sprintf("credentials expired for aws profile %q — run: aws sso login --profile %s", profile.AWSProfile, profile.AWSProfile), si.profile, si.service.Name)
+	return true
 }
 
 // reconnecting records err as the service's last error and moves it to Reconnecting. It reports
