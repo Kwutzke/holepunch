@@ -16,6 +16,10 @@ import (
 	"github.com/Kwutzke/holepunch/internal/state"
 )
 
+// targetRotationRetryDelay replaces the exponential backoff after a rotated-out target: a rotation
+// should cost one short pause, but a whole ASG mid-replacement must not spin Resolve against AWS.
+const targetRotationRetryDelay = 500 * time.Millisecond
+
 // ServiceStatus represents the current status of a single service.
 type ServiceStatus struct {
 	Profile     string
@@ -27,42 +31,12 @@ type ServiceStatus struct {
 	Error       error
 }
 
-// serviceInstance tracks a running service within the engine.
-type serviceInstance struct {
-	mu          sync.Mutex
-	profile     string
-	service     config.Service
-	state       state.ServiceState
-	session     session.Session
-	tcpProxy    TCPProxy
-	cancel      context.CancelFunc
-	backoff     *reconnect.Backoff
-	connectedAt time.Time
-	lastError   error
-	localIP     string
-}
-
-func (si *serviceInstance) getState() state.ServiceState {
-	si.mu.Lock()
-	defer si.mu.Unlock()
-	return si.state
-}
-
-func (si *serviceInstance) transition(to state.ServiceState) error {
-	si.mu.Lock()
-	defer si.mu.Unlock()
-	if err := state.Transition(si.state, to); err != nil {
-		return err
-	}
-	si.state = to
-	return nil
-}
-
 // Engine orchestrates port-forwarding sessions for all profiles.
 type Engine struct {
 	cfg        config.Config
 	dns        DNSManager
 	sessions   SessionManager
+	bastion    BastionResolver
 	ips        IPAllocator
 	proxies    ProxyFactory
 	events     chan Event
@@ -72,11 +46,12 @@ type Engine struct {
 }
 
 // New creates a new Engine.
-func New(cfg config.Config, dnsMgr DNSManager, sessMgr SessionManager, ipAlloc IPAllocator, proxyFactory ProxyFactory) *Engine {
+func New(cfg config.Config, dnsMgr DNSManager, sessMgr SessionManager, bastionResolver BastionResolver, ipAlloc IPAllocator, proxyFactory ProxyFactory) *Engine {
 	return &Engine{
 		cfg:       cfg,
 		dns:       dnsMgr,
 		sessions:  sessMgr,
+		bastion:   bastionResolver,
 		ips:       ipAlloc,
 		proxies:   proxyFactory,
 		events:    make(chan Event, 100),
@@ -84,39 +59,9 @@ func New(cfg config.Config, dnsMgr DNSManager, sessMgr SessionManager, ipAlloc I
 	}
 }
 
-// Events returns the channel on which engine events are published.
+// Events returns the event channel; events are dropped, not queued, once its 100-slot buffer is full.
 func (e *Engine) Events() <-chan Event {
 	return e.events
-}
-
-func (e *Engine) emit(evt Event) {
-	select {
-	case e.events <- evt:
-	default:
-		// Drop event if channel is full — don't block the engine.
-	}
-}
-
-func (e *Engine) emitLog(level, msg, profile, service string) {
-	e.emit(LogEntry{
-		Level:   level,
-		Message: msg,
-		Profile: profile,
-		Service: service,
-		Time:    time.Now(),
-	})
-}
-
-func (e *Engine) emitStateChange(si *serviceInstance, from, to state.ServiceState, err error) {
-	e.emit(ServiceStateChanged{
-		Profile:     si.profile,
-		ServiceName: si.service.Name,
-		DNSName:     si.service.DNSName,
-		From:        from,
-		To:          to,
-		Error:       err,
-		Timestamp:   time.Now(),
-	})
 }
 
 // Config returns a snapshot of the engine's config. Used by the daemon's
@@ -124,45 +69,6 @@ func (e *Engine) emitStateChange(si *serviceInstance, from, to state.ServiceStat
 // response so UIs can render a complete service inventory.
 func (e *Engine) Config() config.Config {
 	return e.cfg
-}
-
-// target identifies a single configured service.
-type target struct {
-	profile string
-	service config.Service
-}
-
-// resolveTargets expands selector strings into concrete configured
-// services. Each selector is either "profile" (expands to every service
-// in the profile) or "profile/service" (a single service). Returns an
-// error for unknown profiles or services.
-func (e *Engine) resolveTargets(selectors []string) ([]target, error) {
-	var out []target
-	for _, sel := range selectors {
-		profileName, serviceName, hasService := strings.Cut(sel, "/")
-		profile, ok := e.cfg.Profiles[profileName]
-		if !ok {
-			return nil, fmt.Errorf("unknown profile: %q", profileName)
-		}
-		if !hasService {
-			for _, svc := range profile.Services {
-				out = append(out, target{profile: profileName, service: svc})
-			}
-			continue
-		}
-		var match *config.Service
-		for i := range profile.Services {
-			if profile.Services[i].Name == serviceName {
-				match = &profile.Services[i]
-				break
-			}
-		}
-		if match == nil {
-			return nil, fmt.Errorf("unknown service: %q", sel)
-		}
-		out = append(out, target{profile: profileName, service: *match})
-	}
-	return out, nil
 }
 
 // Start begins port-forwarding for the specified selectors. Each selector
@@ -309,6 +215,39 @@ func (e *Engine) Status() []ServiceStatus {
 	return statuses
 }
 
+// resolveTargets expands selector strings into concrete configured
+// services. Each selector is either "profile" (expands to every service
+// in the profile) or "profile/service" (a single service). Returns an
+// error for unknown profiles or services.
+func (e *Engine) resolveTargets(selectors []string) ([]target, error) {
+	var out []target
+	for _, sel := range selectors {
+		profileName, serviceName, hasService := strings.Cut(sel, "/")
+		profile, ok := e.cfg.Profiles[profileName]
+		if !ok {
+			return nil, fmt.Errorf("unknown profile: %q", profileName)
+		}
+		if !hasService {
+			for _, svc := range profile.Services {
+				out = append(out, target{profile: profileName, service: svc})
+			}
+			continue
+		}
+		var match *config.Service
+		for i := range profile.Services {
+			if profile.Services[i].Name == serviceName {
+				match = &profile.Services[i]
+				break
+			}
+		}
+		if match == nil {
+			return nil, fmt.Errorf("unknown service: %q", sel)
+		}
+		out = append(out, target{profile: profileName, service: *match})
+	}
+	return out, nil
+}
+
 func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile config.Profile) {
 	key := si.profile + "/" + si.service.Name
 
@@ -319,7 +258,6 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 		default:
 		}
 
-		// Transition to Starting.
 		from := si.getState()
 		if err := si.transition(state.Starting); err != nil {
 			e.emitLog("error", fmt.Sprintf("invalid transition to Starting from %v: %v", from, err), si.profile, si.service.Name)
@@ -327,7 +265,6 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 		}
 		e.emitStateChange(si, from, state.Starting, nil)
 
-		// Add DNS entry.
 		ip, _ := e.ips.Allocate(key)
 		err := e.dns.Add(ctx, []dns.Entry{{IP: ip, Hostname: si.service.DNSName}})
 		if err != nil {
@@ -340,7 +277,6 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 			return
 		}
 
-		// Pick a free port for SSM to bind on 127.0.0.1.
 		ssmPort, err := freePort()
 		if err != nil {
 			si.mu.Lock()
@@ -351,11 +287,20 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 			return
 		}
 
-		// Start SSM session on 127.0.0.1:<random>.
+		target, err := e.bastion.Resolve(ctx, profile)
+		if err != nil {
+			si.mu.Lock()
+			si.lastError = err
+			si.mu.Unlock()
+			_ = si.transition(state.Failed)
+			e.emitStateChange(si, state.Starting, state.Failed, err)
+			return
+		}
+
 		sess, err := e.sessions.Start(ctx, session.StartParams{
 			AWSProfile: profile.AWSProfile,
 			AWSRegion:  profile.AWSRegion,
-			Target:     profile.Target,
+			Target:     target,
 			RemoteHost: si.service.RemoteHost,
 			RemotePort: si.service.RemotePort,
 			LocalIP:    net.IPv4(127, 0, 0, 1),
@@ -370,7 +315,6 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 			return
 		}
 
-		// Start proxy: 127.0.0.x:<real_port> → 127.0.0.1:<ssm_port>.
 		listenAddr := fmt.Sprintf("%s:%d", ip.String(), si.service.LocalPort)
 		targetAddr := fmt.Sprintf("127.0.0.1:%d", ssmPort)
 		tcpProxy, err := e.proxies.NewProxy(ctx, ProxyConfig{
@@ -396,7 +340,6 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 		si.tcpProxy = tcpProxy
 		si.mu.Unlock()
 
-		// Transition to Connected.
 		_ = si.transition(state.Connected)
 		si.mu.Lock()
 		si.connectedAt = time.Now()
@@ -405,25 +348,25 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 		e.emitStateChange(si, state.Starting, state.Connected, nil)
 		e.emitLog("info", fmt.Sprintf("connected via %s:%d (ssm port %d)", si.localIP, si.service.LocalPort, ssmPort), si.profile, si.service.Name)
 
-		// Wait for session to exit.
 		waitErr := sess.Wait()
 
-		// Check if we were asked to stop.
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
 
-		// Session dropped — stop proxy and transition to Reconnecting.
+		// proxy.Stop waits out in-flight connections, seconds for long-lived clients; under si.mu
+		// that wait would block Status and stopService on this instance.
 		si.mu.Lock()
-		if si.tcpProxy != nil {
-			si.tcpProxy.Stop()
-			si.tcpProxy = nil
-		}
+		proxy := si.tcpProxy
+		si.tcpProxy = nil
 		si.lastError = waitErr
 		si.session = nil
 		si.mu.Unlock()
+		if proxy != nil {
+			proxy.Stop()
+		}
 
 		if err := si.transition(state.Reconnecting); err != nil {
 			e.emitLog("error", fmt.Sprintf("cannot transition to Reconnecting: %v", err), si.profile, si.service.Name)
@@ -431,8 +374,7 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 		}
 		e.emitStateChange(si, state.Connected, state.Reconnecting, waitErr)
 
-		// Halt on expired credentials — reconnecting burns cycles against a
-		// dead token. User must `aws sso login` and trigger a restart.
+		// No retry can succeed until the user runs `aws sso login` and restarts the service.
 		if errors.Is(waitErr, session.ErrCredentialsExpired) {
 			_ = si.transition(state.Failed)
 			e.emitStateChange(si, state.Reconnecting, state.Failed, waitErr)
@@ -447,7 +389,21 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 			return
 		}
 
-		// Check if connection was stable enough to reset backoff.
+		if errors.Is(waitErr, session.ErrTargetNotConnected) {
+			e.bastion.Invalidate(profile)
+			invalidated := profile.TargetASG
+			if invalidated == "" {
+				invalidated = profile.Target
+			}
+			e.emitLog("warn", fmt.Sprintf("ssm target rotated (%s) — re-resolving (%v)", invalidated, waitErr), si.profile, si.service.Name)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(targetRotationRetryDelay):
+			}
+			continue
+		}
+
 		if si.backoff.ShouldReset() {
 			si.backoff.Reset()
 		}
@@ -460,15 +416,6 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 			return
 		case <-time.After(delay):
 		}
-
-		// Transition back to Starting for the reconnect loop.
-		_ = si.transition(state.Starting)
-		e.emitStateChange(si, state.Reconnecting, state.Starting, nil)
-
-		// Reset state so the loop re-enters from Starting -> Connected.
-		si.mu.Lock()
-		si.state = state.Disconnected
-		si.mu.Unlock()
 	}
 }
 
@@ -494,14 +441,81 @@ func (e *Engine) stopService(ctx context.Context, si *serviceInstance) {
 	}
 
 	si.mu.Lock()
-	if si.tcpProxy != nil {
-		si.tcpProxy.Stop()
-		si.tcpProxy = nil
-	}
+	proxy := si.tcpProxy
+	si.tcpProxy = nil
 	si.mu.Unlock()
+	if proxy != nil {
+		proxy.Stop()
+	}
 
 	_ = si.transition(state.Disconnected)
 	e.emitStateChange(si, state.Stopping, state.Disconnected, nil)
+}
+
+func (e *Engine) emit(evt Event) {
+	select {
+	case e.events <- evt:
+	default:
+	}
+}
+
+func (e *Engine) emitLog(level, msg, profile, service string) {
+	e.emit(LogEntry{
+		Level:   level,
+		Message: msg,
+		Profile: profile,
+		Service: service,
+		Time:    time.Now(),
+	})
+}
+
+func (e *Engine) emitStateChange(si *serviceInstance, from, to state.ServiceState, err error) {
+	e.emit(ServiceStateChanged{
+		Profile:     si.profile,
+		ServiceName: si.service.Name,
+		DNSName:     si.service.DNSName,
+		From:        from,
+		To:          to,
+		Error:       err,
+		Timestamp:   time.Now(),
+	})
+}
+
+// serviceInstance tracks a running service within the engine.
+type serviceInstance struct {
+	mu          sync.Mutex
+	profile     string
+	service     config.Service
+	state       state.ServiceState
+	session     session.Session
+	tcpProxy    TCPProxy
+	cancel      context.CancelFunc
+	backoff     *reconnect.Backoff
+	connectedAt time.Time
+	lastError   error
+	localIP     string
+}
+
+func (si *serviceInstance) getState() state.ServiceState {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	return si.state
+}
+
+func (si *serviceInstance) transition(to state.ServiceState) error {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	if err := state.Transition(si.state, to); err != nil {
+		return err
+	}
+	si.state = to
+	return nil
+}
+
+// target identifies a single configured service.
+type target struct {
+	profile string
+	service config.Service
 }
 
 // freePort asks the OS for an available port on 127.0.0.1.

@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+// Session represents a running SSM port-forwarding session.
+type Session interface {
+	PID() int
+	Wait() error
+	Stop(ctx context.Context) error
+}
+
+// Manager starts SSM port-forwarding sessions.
+type Manager interface {
+	Start(ctx context.Context, params StartParams) (Session, error)
+}
+
 // stderrCaptureSize bounds the ring buffer holding recent aws-cli stderr.
 // 8 KiB keeps the full SSO-token error text (typically <2 KiB) without
 // risking unbounded memory growth on a noisy child.
@@ -25,18 +37,6 @@ type StartParams struct {
 	RemotePort int
 	LocalIP    net.IP
 	LocalPort  int
-}
-
-// Session represents a running SSM port-forwarding session.
-type Session interface {
-	PID() int
-	Wait() error
-	Stop(ctx context.Context) error
-}
-
-// Manager starts SSM port-forwarding sessions.
-type Manager interface {
-	Start(ctx context.Context, params StartParams) (Session, error)
 }
 
 // CommandFactory creates exec.Cmd instances. Injectable for testing.
@@ -71,35 +71,6 @@ func (m *SSMManager) Start(ctx context.Context, params StartParams) (Session, er
 	return &ssmSession{cmd: cmd, stderr: stderrBuf}, nil
 }
 
-// BuildSSMArgs constructs the AWS CLI arguments for an SSM port-forwarding session.
-// Exported for testing command construction without starting a process.
-func BuildSSMArgs(params StartParams) []string {
-	return buildSSMArgs(params)
-}
-
-func buildSSMArgs(params StartParams) []string {
-	paramJSON := fmt.Sprintf(
-		`{"host":["%s"],"portNumber":["%d"],"localPortNumber":["%d"]}`,
-		params.RemoteHost, params.RemotePort, params.LocalPort,
-	)
-
-	args := []string{
-		"ssm", "start-session",
-		"--target", params.Target,
-		"--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
-		"--parameters", paramJSON,
-	}
-
-	if params.AWSProfile != "" {
-		args = append(args, "--profile", params.AWSProfile)
-	}
-	if params.AWSRegion != "" {
-		args = append(args, "--region", params.AWSRegion)
-	}
-
-	return args
-}
-
 type ssmSession struct {
 	cmd    *exec.Cmd
 	stderr *ringBuffer
@@ -117,12 +88,15 @@ func (s *ssmSession) Wait() error {
 	if err == nil {
 		return nil
 	}
-	if s.stderr != nil && matchesCredentialsExpired(s.stderr.Bytes()) {
-		snippet := expiredSnippet(s.stderr.Bytes())
-		if snippet == "" {
-			return fmt.Errorf("%w: %v", ErrCredentialsExpired, err)
-		}
-		return fmt.Errorf("%w: %s", ErrCredentialsExpired, snippet)
+	if s.stderr == nil {
+		return err
+	}
+	stderrBytes := s.stderr.Bytes()
+	if matchesCredentialsExpired(stderrBytes) {
+		return wrapSessionErr(ErrCredentialsExpired, expiredSnippet(stderrBytes), err)
+	}
+	if matchesTargetNotConnected(stderrBytes) {
+		return wrapSessionErr(ErrTargetNotConnected, targetNotConnectedSnippet(stderrBytes), err)
 	}
 	return err
 }
@@ -164,6 +138,42 @@ func (s *ssmSession) Stop(ctx context.Context) error {
 		}
 		return ctx.Err()
 	}
+}
+
+// BuildSSMArgs constructs the AWS CLI arguments for an SSM port-forwarding session.
+// Exported for testing command construction without starting a process.
+func BuildSSMArgs(params StartParams) []string {
+	return buildSSMArgs(params)
+}
+
+func buildSSMArgs(params StartParams) []string {
+	paramJSON := fmt.Sprintf(
+		`{"host":["%s"],"portNumber":["%d"],"localPortNumber":["%d"]}`,
+		params.RemoteHost, params.RemotePort, params.LocalPort,
+	)
+
+	args := []string{
+		"ssm", "start-session",
+		"--target", params.Target,
+		"--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
+		"--parameters", paramJSON,
+	}
+
+	if params.AWSProfile != "" {
+		args = append(args, "--profile", params.AWSProfile)
+	}
+	if params.AWSRegion != "" {
+		args = append(args, "--region", params.AWSRegion)
+	}
+
+	return args
+}
+
+func wrapSessionErr(sentinel error, snippet string, cause error) error {
+	if snippet == "" {
+		return fmt.Errorf("%w: %v", sentinel, cause)
+	}
+	return fmt.Errorf("%w: %s", sentinel, snippet)
 }
 
 func isProcessFinished(err error) bool {

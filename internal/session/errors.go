@@ -5,16 +5,15 @@ import (
 	"strings"
 )
 
-// ErrCredentialsExpired signals that aws ssm start-session failed because the
-// underlying AWS credentials (typically an SSO session) are no longer valid.
-// When returned from Session.Wait, the engine halts reconnect attempts and
-// emits a CredentialsExpired event so the user can re-authenticate.
+// ErrCredentialsExpired is wrapped by Session.Wait when aws-cli stderr shows an
+// expired SSO session or token; no retry can succeed until the user logs in again.
 var ErrCredentialsExpired = errors.New("aws credentials expired")
 
-// expiredPatterns lists stderr substrings that indicate expired credentials.
-// Matching is case-insensitive. The AWS CLI wording varies across versions —
-// the matched snippet is preserved in the wrapped error so drift can be
-// diagnosed from event telemetry rather than source diving.
+// ErrTargetNotConnected is wrapped by Session.Wait when SSM reports the instance
+// gone (terminated, agent offline, rotated out of its ASG): re-resolve before retrying.
+var ErrTargetNotConnected = errors.New("aws ssm target not connected")
+
+// Several phrasings for one condition: the AWS CLI rewords this across versions.
 var expiredPatterns = []string{
 	"Error loading SSO Token",
 	"The SSO session associated with this profile has expired",
@@ -24,14 +23,44 @@ var expiredPatterns = []string{
 	"Your short-term credentials have expired",
 }
 
+// targetNotConnectedPatterns lists stderr substrings that identify the
+// AWS SSM "TargetNotConnected" error. The error code is the canonical
+// signal; the message wording ("i-xxx is not connected") is the common form.
+var targetNotConnectedPatterns = []string{
+	"TargetNotConnected",
+}
+
 // matchesCredentialsExpired reports whether the given stderr bytes contain any
 // of the known expired-credentials patterns.
 func matchesCredentialsExpired(stderr []byte) bool {
+	return containsAnyPattern(stderr, expiredPatterns)
+}
+
+// expiredSnippet returns the first line of stderr that contains a known
+// expired-credentials pattern, trimmed — used as diagnostic detail in the
+// wrapped error and in emitted events.
+func expiredSnippet(stderr []byte) string {
+	return firstMatchingLine(stderr, expiredPatterns)
+}
+
+// matchesTargetNotConnected reports whether the given stderr bytes contain the
+// SSM TargetNotConnected signal.
+func matchesTargetNotConnected(stderr []byte) bool {
+	return containsAnyPattern(stderr, targetNotConnectedPatterns)
+}
+
+// targetNotConnectedSnippet returns the first line of stderr that identifies a
+// TargetNotConnected error, trimmed.
+func targetNotConnectedSnippet(stderr []byte) string {
+	return firstMatchingLine(stderr, targetNotConnectedPatterns)
+}
+
+func containsAnyPattern(stderr []byte, patterns []string) bool {
 	if len(stderr) == 0 {
 		return false
 	}
 	lower := strings.ToLower(string(stderr))
-	for _, p := range expiredPatterns {
+	for _, p := range patterns {
 		if strings.Contains(lower, strings.ToLower(p)) {
 			return true
 		}
@@ -39,12 +68,9 @@ func matchesCredentialsExpired(stderr []byte) bool {
 	return false
 }
 
-// expiredSnippet returns the first line of stderr that contains a known
-// expired-credentials pattern, trimmed — used as diagnostic detail in the
-// wrapped error and in emitted events.
-func expiredSnippet(stderr []byte) string {
+func firstMatchingLine(stderr []byte, patterns []string) string {
 	lower := strings.ToLower(string(stderr))
-	for _, p := range expiredPatterns {
+	for _, p := range patterns {
 		idx := strings.Index(lower, strings.ToLower(p))
 		if idx < 0 {
 			continue

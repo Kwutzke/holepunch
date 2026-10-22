@@ -20,13 +20,14 @@ type Defaults struct {
 
 type ReconnectConfig struct {
 	MaxBackoffSeconds int `yaml:"max_backoff_seconds"`
-	MaxAttempts       int `yaml:"max_attempts"` // 0 = unlimited
+	MaxAttempts       int `yaml:"max_attempts"`
 }
 
 type Profile struct {
 	AWSProfile string    `yaml:"aws_profile"`
 	AWSRegion  string    `yaml:"aws_region"`
 	Target     string    `yaml:"target"`
+	TargetASG  string    `yaml:"target_asg"`
 	Services   []Service `yaml:"services"`
 }
 
@@ -99,8 +100,11 @@ func validate(cfg Config) error {
 		if profile.AWSRegion == "" {
 			return fmt.Errorf("config validation: profile %q: aws_region is required", profileName)
 		}
-		if profile.Target == "" {
-			return fmt.Errorf("config validation: profile %q: target is required", profileName)
+		switch {
+		case profile.Target == "" && profile.TargetASG == "":
+			return fmt.Errorf("config validation: profile %q: either target or target_asg is required", profileName)
+		case profile.Target != "" && profile.TargetASG != "":
+			return fmt.Errorf("config validation: profile %q: target and target_asg are mutually exclusive", profileName)
 		}
 		if len(profile.Services) == 0 {
 			return fmt.Errorf("config validation: profile %q: no services defined", profileName)

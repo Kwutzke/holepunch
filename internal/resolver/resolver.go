@@ -5,18 +5,22 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	mdns "github.com/miekg/dns"
 )
 
-// Resolver is an embedded DNS server that resolves configured hostnames
-// to their assigned loopback IPs. It listens on a high port (no root needed)
-// and macOS /etc/resolver/ files route queries to it.
+// Resolver answers for registered names on a non-privileged port, where the
+// /etc/resolver/ files written by setup route each configured TLD. Unregistered
+// names are forwarded upstream because claiming a TLD would otherwise
+// black-hole the real domains under it (web.dev once foo.dev is registered).
 type Resolver struct {
-	mu      sync.RWMutex
-	records map[string]net.IP // FQDN (with trailing dot) -> IP
-	server  *mdns.Server
-	addr    string
+	mu       sync.RWMutex
+	records  map[string]net.IP // FQDN (with trailing dot) -> IP
+	server   *mdns.Server
+	addr     string
+	upstream []string     // "ip:port" servers; empty disables forwarding
+	client   *mdns.Client // lazily initialized, guarded by mu
 }
 
 // New creates a Resolver that will listen on the given address (e.g. "127.0.0.1:15353").
@@ -26,6 +30,15 @@ func New(addr string) *Resolver {
 		addr:    addr,
 	}
 	return r
+}
+
+// SetUpstream configures the upstream nameservers used to forward queries for
+// names not registered with the resolver. Servers are addresses of the form
+// "ip:port". Passing nil or an empty slice disables forwarding. Call before Start.
+func (r *Resolver) SetUpstream(servers []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upstream = append([]string(nil), servers...)
 }
 
 // Start begins serving DNS queries. Non-blocking.
@@ -46,7 +59,6 @@ func (r *Resolver) Start() error {
 		errCh <- r.server.ListenAndServe()
 	}()
 
-	// Wait until the server is ready or fails.
 	select {
 	case err := <-errCh:
 		return fmt.Errorf("DNS server failed to start: %w", err)
@@ -90,20 +102,24 @@ func (r *Resolver) Records() map[string]net.IP {
 }
 
 func (r *Resolver) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
-	msg := new(mdns.Msg)
-	msg.SetReply(req)
-	msg.Authoritative = true
+	if len(req.Question) == 0 {
+		msg := new(mdns.Msg)
+		msg.SetReply(req)
+		_ = w.WriteMsg(msg)
+		return
+	}
 
-	for _, q := range req.Question {
-		if q.Qtype != mdns.TypeA && q.Qtype != mdns.TypeAAAA {
-			continue
-		}
+	q := req.Question[0]
+	r.mu.RLock()
+	ip, owned := r.records[q.Name]
+	upstream := r.upstream
+	r.mu.RUnlock()
 
-		r.mu.RLock()
-		ip, ok := r.records[q.Name]
-		r.mu.RUnlock()
-
-		if ok && q.Qtype == mdns.TypeA {
+	if owned {
+		msg := new(mdns.Msg)
+		msg.SetReply(req)
+		msg.Authoritative = true
+		if q.Qtype == mdns.TypeA {
 			msg.Answer = append(msg.Answer, &mdns.A{
 				Hdr: mdns.RR_Header{
 					Name:   q.Name,
@@ -114,9 +130,54 @@ func (r *Resolver) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 				A: ip.To4(),
 			})
 		}
+		_ = w.WriteMsg(msg)
+		return
 	}
 
-	w.WriteMsg(msg)
+	if len(upstream) == 0 {
+		msg := new(mdns.Msg)
+		msg.SetReply(req)
+		msg.Authoritative = true
+		_ = w.WriteMsg(msg)
+		return
+	}
+
+	reply, err := r.forward(req, upstream)
+	if err != nil {
+		msg := new(mdns.Msg)
+		msg.SetReply(req)
+		msg.Rcode = mdns.RcodeServerFailure
+		_ = w.WriteMsg(msg)
+		return
+	}
+	reply.Id = req.Id
+	reply.Authoritative = false
+	reply.RecursionAvailable = true
+	_ = w.WriteMsg(reply)
+}
+
+// forward sends req to each upstream in order and returns the first successful
+// reply. Returns an error only when all upstreams fail.
+func (r *Resolver) forward(req *mdns.Msg, upstream []string) (*mdns.Msg, error) {
+	client := r.forwardClient()
+	var lastErr error
+	for _, server := range upstream {
+		reply, _, err := client.Exchange(req, server)
+		if err == nil {
+			return reply, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (r *Resolver) forwardClient() *mdns.Client {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.client == nil {
+		r.client = &mdns.Client{Timeout: 2 * time.Second}
+	}
+	return r.client
 }
 
 // ExtractTLDs returns the unique top-level domains from a list of hostnames.

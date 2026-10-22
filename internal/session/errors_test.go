@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestMatchesCredentialsExpired(t *testing.T) {
+func Test_matchesCredentialsExpired(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -35,7 +35,51 @@ func TestMatchesCredentialsExpired(t *testing.T) {
 	}
 }
 
-func TestExpiredSnippet(t *testing.T) {
+func Test_matchesTargetNotConnected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{"empty", "", false},
+		{"unrelated error", "An error occurred (AccessDenied) when calling the StartSession operation", false},
+		{"canonical error", "An error occurred (TargetNotConnected) when calling the StartSession operation: i-019242a1bc22c3a59 is not connected.", true},
+		{"case insensitive", "an error occurred (targetnotconnected) when calling", true},
+		{"pattern mid-stream", strings.Repeat("noise\n", 50) + "TargetNotConnected\n" + strings.Repeat("noise\n", 50), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, matchesTargetNotConnected([]byte(tt.stderr)))
+		})
+	}
+}
+
+func Test_targetNotConnectedSnippet(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		stderr string
+		want   string
+	}{
+		{"no match", "nothing interesting", ""},
+		{"canonical error", "An error occurred (TargetNotConnected): i-xxx is not connected", "An error occurred (TargetNotConnected): i-xxx is not connected"},
+		{"pattern in middle line", "prelude\nAn error occurred (TargetNotConnected): i-xxx is not connected\npostlude", "An error occurred (TargetNotConnected): i-xxx is not connected"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, targetNotConnectedSnippet([]byte(tt.stderr)))
+		})
+	}
+}
+
+func Test_expiredSnippet(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
