@@ -179,7 +179,7 @@ profiles:
                 └───────────────┘
 ```
 
-1. **DNS** — macOS `/etc/resolver/` routes queries for configured TLDs to holepunch's embedded DNS server (port 15353). Each service resolves to a unique `127.0.0.x` address.
+1. **DNS** — macOS `/etc/resolver/` routes queries for configured TLDs to holepunch's embedded DNS server (port 15353). Each service resolves to a unique `127.0.0.x` address. Every other name under a configured TLD is forwarded to the system's nameservers, so claiming `dev` for `foo.dev` does not black-hole `web.dev`. The daemon reads those nameservers once at startup from `/etc/resolv.conf` (on systemd-resolved hosts, `/run/systemd/resolve/resolv.conf`); with none found, unowned names get an empty answer.
 
 2. **Loopback aliases** — `ifconfig lo0 alias 127.0.0.x` creates the addresses. A LaunchDaemon recreates them on reboot.
 
@@ -197,6 +197,7 @@ profiles:
 cmd/              CLI layer (cobra) — thin, delegates to daemon
 internal/
   config/         YAML config parsing + validation
+  bastion/        SSM target lookup from an Auto Scaling group (target_asg)
   state/          Service state machine with transition validation
   reconnect/      Exponential backoff calculator
   ip/             Deterministic loopback IP allocator (FNV hash)
