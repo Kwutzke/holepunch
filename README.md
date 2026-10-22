@@ -183,7 +183,7 @@ profiles:
 
 2. **Loopback aliases** — `ifconfig lo0 alias 127.0.0.x` creates the addresses. A LaunchDaemon recreates them on reboot.
 
-3. **SSM tunnel** — `aws ssm start-session` opens a port-forwarding session through the bastion to the remote service. Binds to `127.0.0.1:<random-high-port>`.
+3. **SSM tunnel** — `aws ssm start-session` opens a port-forwarding session through the bastion to the remote service. Binds to `127.0.0.1:<random-high-port>`. `aws` runs as the leader of its own process group, and stopping a session terminates the whole group, so `session-manager-plugin` exits with it. `holepunch down -f` kills the daemon with SIGKILL, which leaves each running group behind.
 
 4. **TCP proxy** — listens on `127.0.0.x:<real-port>` and forwards to the SSM tunnel on `127.0.0.1:<random-port>`. This bridges the unique IP to the SSM-bound port.
 
