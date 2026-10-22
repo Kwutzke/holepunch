@@ -124,7 +124,7 @@ holepunch down            # stop all + kill daemon
 | `holepunch down -f` | Force kill an unresponsive daemon. |
 | `holepunch restart` | Stop everything, restart daemon, reconnect all profiles. |
 | `holepunch status` | Show connection states, addresses, uptime, errors. |
-| `holepunch logs -f` | Stream daemon events (connections, reconnects, errors). |
+| `holepunch logs -f` | Stream daemon events (connections, reconnects, errors). The daemon's full output, including `aws` errors, is appended to `~/.holepunch/daemon.log`, which moves to `daemon.log.1` at launch once above 10 MiB. |
 | `holepunch setup` | One-time setup: DNS resolver files + loopback aliases (needs sudo). |
 | `holepunch unsetup` | Remove all setup artifacts. |
 
