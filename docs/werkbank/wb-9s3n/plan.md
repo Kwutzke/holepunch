@@ -58,7 +58,14 @@ The design is `docs/werkbank/wb-9s3n/design.md`. Its box 10 holds the acceptance
     {
       "title": "tunnels recover from sleep and network changes, retry failed starts, leave no plugin behind and keep a log",
       "reason": "value on its own",
-      "merge_blocking": false
+      "merge_blocking": false,
+      "subtasks": [
+        {"title": "stopping or cancelling a session terminates its whole process group, so no session-manager-plugin outlives its session (A1)", "check": "an acceptance test runs the real SSM manager with an aws stand-in that spawns a never-exiting child; it fails on the base because the child survives, and passes once both stop and context cancel leave the child's PID gone"},
+        {"title": "a transient start failure (DNS, bastion lookup, session start, proxy listen) retries on the backoff through Reconnecting; expired credentials still stop at Failed; down during a retry ends in Disconnected (A2, A3)", "check": "engine acceptance tests in which each start step fails twice and then succeeds fail on the base by stopping at Failed, and pass by reaching Connected; the credentials-expired test passes unchanged; the state-machine test accepts Starting to Reconnecting"},
+        {"title": "a network watcher emits one event when the wall clock jumps past the tick interval (sleep) or the local non-loopback address set changes, and none in a steady state (A4)", "check": "watcher tests driven by an injected clock and address list show one event per sleep gap, one per address change and none across steady ticks"},
+        {"title": "on a network event the engine stops the session of every Connected service without cancelling it, and the daemon wires the watcher to the engine, so dead tunnels reconnect on their own (A5, journey J)", "check": "an engine acceptance test with the real SSM manager, a never-exiting stand-in and a fake watcher fails on the base and passes by showing a second session per service, the old process groups gone and every service Connected; the journey test adds two failing bastion lookups after the event and a final down that leaves no stand-in process"},
+        {"title": "daemon output, including the aws children's stderr, is appended to ~/.holepunch/daemon.log, which is rotated to daemon.log.1 at launch when it exceeds 10 MiB (A6)", "check": "a test that launches twice with a temporary home finds the first launch's line still in daemon.log, and a log above the cap moves to daemon.log.1; a manual Wi-Fi switch to the hotspot shows every service Connected again within 30 s and the event in the log"}
+      ]
     }
   ],
   "many_slices": ""
