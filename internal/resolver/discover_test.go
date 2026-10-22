@@ -62,3 +62,31 @@ func Test_discoverFromConfig(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+func Test_discoverFromFirst(t *testing.T) {
+	t.Parallel()
+
+	t.Run("prefers the systemd upstream file over the stub", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		systemdPath := filepath.Join(dir, "systemd-resolv.conf")
+		stubPath := filepath.Join(dir, "resolv.conf")
+		require.NoError(t, os.WriteFile(systemdPath, []byte("nameserver 127.0.0.1\nnameserver 10.0.0.2\n"), 0o644))
+		require.NoError(t, os.WriteFile(stubPath, []byte("nameserver 127.0.0.53\n"), 0o644))
+
+		got, err := discoverFromFirst([]string{systemdPath, stubPath}, "127.0.0.1:15353")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"10.0.0.2:53"}, got, "the stub routes claimed TLDs back to holepunch")
+	})
+
+	t.Run("falls back when the systemd file is absent", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		stubPath := filepath.Join(dir, "resolv.conf")
+		require.NoError(t, os.WriteFile(stubPath, []byte("nameserver 192.168.1.1\n"), 0o644))
+
+		got, err := discoverFromFirst([]string{filepath.Join(dir, "absent.conf"), stubPath}, "127.0.0.1:15353")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"192.168.1.1:53"}, got)
+	})
+}

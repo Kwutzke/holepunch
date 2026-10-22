@@ -135,7 +135,8 @@ profiles:
   <profile-name>:
     aws_profile: <string>       # AWS CLI profile (supports SSO)
     aws_region: <string>        # AWS region
-    target: <string>            # SSM-managed EC2 instance ID (bastion)
+    target: <string>            # SSM-managed EC2 instance ID (bastion); or:
+    target_asg: <string>        # Auto Scaling group whose instances act as the bastion
     services:
       - name: <string>          # service identifier
         dns_name: <string>      # local DNS name (e.g. "postgres.staging")
@@ -151,6 +152,7 @@ profiles:
 - **`sigv4_service`** — when set, holepunch runs an HTTP reverse proxy that signs every request with your AWS credentials (resolved from `aws_profile`). Required for IAM-authenticated OpenSearch. Set to `es` for OpenSearch/Elasticsearch Service.
 - **`dns_name`** — fully configurable. The TLD determines which `/etc/resolver/` file is created during setup. Multiple TLDs are supported.
 - **`target`** — the SSM-managed EC2 instance used as the tunnel endpoint. Must have network access to the `remote_host`. Typically a bastion or ECS instance in the same VPC.
+- **`target_asg`** — use instead of `target` when the bastion is replaced by an Auto Scaling group (AMI refresh, patching), so a pinned instance ID would go stale. Exactly one of `target` and `target_asg` is required. holepunch picks an `InService` instance that SSM reports `Online`, caches it, and picks again when SSM says the instance is no longer connected. The lookup needs `autoscaling:DescribeAutoScalingGroups` and `ssm:DescribeInstanceInformation` for `aws_profile`.
 
 ## How it works
 

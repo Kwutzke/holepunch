@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -273,6 +274,66 @@ func TestEngine_runService(t *testing.T) {
 		close(secondDone)
 	})
 
+	t.Run("target not connected on a pinned target takes the backoff", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		ctrl := gomock.NewController(t)
+
+		mockDNS := enginemocks.NewMockDNSManager(ctrl)
+		mockSessions := enginemocks.NewMockSessionManager(ctrl)
+		mockIPs := enginemocks.NewMockIPAllocator(ctrl)
+		mockProxies := setupMockProxy(ctrl)
+		mockBastion := enginemocks.NewMockBastionResolver(ctrl)
+
+		mockIPs.EXPECT().Allocate("dev/opensearch").Return(testIP, nil).AnyTimes()
+		mockDNS.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockBastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("i-0abc123", nil).Times(2)
+
+		firstSession := sessionmocks.NewMockSession(ctrl)
+		firstSession.EXPECT().Wait().Return(fmt.Errorf("%w: i-0abc123 is not connected", session.ErrTargetNotConnected))
+
+		secondSession := sessionmocks.NewMockSession(ctrl)
+		secondDone := make(chan struct{})
+		secondWaited := awaitCalled(t)
+		secondSession.EXPECT().Wait().DoAndReturn(func() error {
+			close(secondWaited)
+			<-secondDone
+			return nil
+		})
+
+		gomock.InOrder(
+			mockSessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(firstSession, nil),
+			mockSessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(secondSession, nil),
+		)
+
+		eng := engine.New(testConfig(), mockDNS, mockSessions, mockBastion, mockIPs, mockProxies)
+		require.NoError(t, eng.Start(ctx, []string{"dev"}))
+
+		var logs []string
+		connected := 0
+		deadline := time.After(5 * time.Second)
+		for connected < 2 {
+			select {
+			case evt := <-eng.Events():
+				switch e := evt.(type) {
+				case engine.LogEntry:
+					logs = append(logs, e.Message)
+				case engine.ServiceStateChanged:
+					if e.To == state.Connected {
+						connected++
+					}
+				}
+			case <-deadline:
+				t.Fatalf("reconnect did not complete; logs: %q", logs)
+			}
+		}
+		close(secondDone)
+
+		joined := strings.Join(logs, "\n")
+		assert.Contains(t, joined, "reconnecting in 1s (attempt 1)", "a pinned target has nothing to re-resolve, so it backs off")
+		assert.NotContains(t, joined, "ssm target rotated")
+	})
+
 	t.Run("target not connected invalidates and retries fast", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
@@ -287,7 +348,10 @@ func TestEngine_runService(t *testing.T) {
 		mockIPs.EXPECT().Allocate("dev/opensearch").Return(testIP, nil).AnyTimes()
 		mockDNS.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 
-		devProfile := testConfig().Profiles["dev"]
+		cfg := testConfig()
+		devProfile := cfg.Profiles["dev"]
+		devProfile.Target, devProfile.TargetASG = "", "bastion-asg"
+		cfg.Profiles["dev"] = devProfile
 
 		// First resolve returns the stale ID; Wait fails with
 		// ErrTargetNotConnected; engine invalidates and re-resolves; second
@@ -324,7 +388,7 @@ func TestEngine_runService(t *testing.T) {
 				}),
 		)
 
-		eng := engine.New(testConfig(), mockDNS, mockSessions, mockBastion, mockIPs, mockProxies)
+		eng := engine.New(cfg, mockDNS, mockSessions, mockBastion, mockIPs, mockProxies)
 
 		require.NoError(t, eng.Start(ctx, []string{"dev"}))
 

@@ -2,16 +2,28 @@ package resolver
 
 import (
 	"net"
+	"os"
 
 	mdns "github.com/miekg/dns"
 )
 
-const defaultResolvConf = "/etc/resolv.conf"
+// systemd-resolved's /etc/resolv.conf names only its stub, which routes the TLDs holepunch claims
+// back to holepunch; the file it keeps under /run lists the real upstreams.
+var resolvConfCandidates = []string{"/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"}
 
-// DiscoverSystemResolvers returns the resolv.conf nameservers as "ip:port", minus any on
+// DiscoverSystemResolvers returns the system's upstream nameservers as "ip:port", minus any on
 // selfAddr's IP (port ignored): forwarding to ourselves would loop.
 func DiscoverSystemResolvers(selfAddr string) ([]string, error) {
-	return discoverFromConfig(defaultResolvConf, selfAddr)
+	return discoverFromFirst(resolvConfCandidates, selfAddr)
+}
+
+func discoverFromFirst(paths []string, selfAddr string) ([]string, error) {
+	for _, p := range paths[:len(paths)-1] {
+		if _, err := os.Stat(p); err == nil {
+			return discoverFromConfig(p, selfAddr)
+		}
+	}
+	return discoverFromConfig(paths[len(paths)-1], selfAddr)
 }
 
 func discoverFromConfig(path, selfAddr string) ([]string, error) {

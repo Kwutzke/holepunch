@@ -16,8 +16,9 @@ import (
 	"github.com/Kwutzke/holepunch/internal/state"
 )
 
-// targetRotationRetryDelay replaces the exponential backoff after a rotated-out target: a rotation
-// should cost one short pause, but a whole ASG mid-replacement must not spin Resolve against AWS.
+// targetRotationRetryDelay replaces the exponential backoff after an ASG target rotated out: a
+// rotation should cost one short pause, but a whole ASG mid-replacement must not spin Resolve
+// against AWS. A pinned target cannot rotate, so it keeps the backoff.
 const targetRotationRetryDelay = 500 * time.Millisecond
 
 // ServiceStatus represents the current status of a single service.
@@ -389,13 +390,9 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 			return
 		}
 
-		if errors.Is(waitErr, session.ErrTargetNotConnected) {
+		if errors.Is(waitErr, session.ErrTargetNotConnected) && profile.TargetASG != "" {
 			e.bastion.Invalidate(profile)
-			invalidated := profile.TargetASG
-			if invalidated == "" {
-				invalidated = profile.Target
-			}
-			e.emitLog("warn", fmt.Sprintf("ssm target rotated (%s) — re-resolving (%v)", invalidated, waitErr), si.profile, si.service.Name)
+			e.emitLog("warn", fmt.Sprintf("ssm target rotated out of %s — re-resolving (%v)", profile.TargetASG, waitErr), si.profile, si.service.Name)
 			select {
 			case <-ctx.Done():
 				return
