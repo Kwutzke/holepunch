@@ -17,16 +17,9 @@ func DiscoverSystemResolvers(selfAddr string) ([]string, error) {
 	return discoverFromFirst(resolvConfCandidates, selfAddr)
 }
 
-func discoverFromFirst(paths []string, selfAddr string) ([]string, error) {
-	for _, p := range paths[:len(paths)-1] {
-		if _, err := os.Stat(p); err == nil {
-			return discoverFromConfig(p, selfAddr)
-		}
-	}
-	return discoverFromConfig(paths[len(paths)-1], selfAddr)
-}
-
-func discoverFromConfig(path, selfAddr string) ([]string, error) {
+// DiscoverFromConfig returns the nameservers of the resolv.conf at path as DiscoverSystemResolvers
+// does.
+func DiscoverFromConfig(path, selfAddr string) ([]string, error) {
 	cfg, err := mdns.ClientConfigFromFile(path)
 	if err != nil {
 		return nil, err
@@ -42,4 +35,13 @@ func discoverFromConfig(path, selfAddr string) ([]string, error) {
 		out = append(out, net.JoinHostPort(s, cfg.Port))
 	}
 	return out, nil
+}
+
+func discoverFromFirst(paths []string, selfAddr string) ([]string, error) {
+	for _, p := range paths[:len(paths)-1] {
+		if _, err := os.Stat(p); err == nil {
+			return DiscoverFromConfig(p, selfAddr)
+		}
+	}
+	return DiscoverFromConfig(paths[len(paths)-1], selfAddr)
 }

@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Kwutzke/holepunch/internal/bastion"
 	"github.com/Kwutzke/holepunch/internal/config"
 	"github.com/Kwutzke/holepunch/internal/daemon"
 	"github.com/Kwutzke/holepunch/internal/engine"
 	"github.com/Kwutzke/holepunch/internal/ip"
+	"github.com/Kwutzke/holepunch/internal/netwatch"
 	"github.com/Kwutzke/holepunch/internal/proxy"
 	"github.com/Kwutzke/holepunch/internal/resolver"
 	"github.com/Kwutzke/holepunch/internal/session"
@@ -71,16 +73,6 @@ func runDaemon(_ *cobra.Command, _ []string) error {
 
 	// Start embedded DNS resolver.
 	dnsResolver := resolver.New(defaultResolverAddr)
-	if upstream, err := resolver.DiscoverSystemResolvers(defaultResolverAddr); err != nil {
-		log.Printf("DNS forwarding disabled (discover upstream: %v)", err)
-	} else {
-		dnsResolver.SetUpstream(upstream)
-		if len(upstream) == 0 {
-			log.Printf("DNS forwarding disabled (no upstream resolvers found)")
-		} else {
-			log.Printf("DNS forwarding enabled (upstream: %v)", upstream)
-		}
-	}
 	if err := dnsResolver.Start(); err != nil {
 		return fmt.Errorf("starting DNS resolver: %w", err)
 	}
@@ -93,6 +85,10 @@ func runDaemon(_ *cobra.Command, _ []string) error {
 	ipAlloc := ip.New()
 
 	eng := engine.New(cfg, dnsMgr, sessMgr, bastionResolver, ipAlloc, realProxyFactory{})
+	network := daemon.NewNetworkFollower(eng, dnsResolver, func() ([]string, error) {
+		return resolver.DiscoverSystemResolvers(defaultResolverAddr)
+	})
+	network.RefreshUpstream()
 
 	srv, err := daemon.NewServer(socketPath, eng)
 	if err != nil {
@@ -101,6 +97,10 @@ func runDaemon(_ *cobra.Command, _ []string) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	watcher := netwatch.New(time.Duration(cfg.Defaults.HealthCheckSeconds) * time.Second)
+	go watcher.Run(ctx)
+	go network.Follow(ctx, watcher.Events())
 
 	// Forward engine events to log output via the Server's Bus. The Bus is
 	// the single consumer of eng.Events(); draining the raw channel here as

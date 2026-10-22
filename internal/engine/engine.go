@@ -193,6 +193,39 @@ func (e *Engine) Stop(ctx context.Context, selectors []string) error {
 	return nil
 }
 
+// DropSessions stops the session of every Connected service without stopping the service, so each
+// reconnects through a new session. It returns once every dropped session has ended.
+func (e *Engine) DropSessions(ctx context.Context, reason string) {
+	e.mu.RLock()
+	instances := make([]*serviceInstance, 0, len(e.instances))
+	for _, si := range e.instances {
+		instances = append(instances, si)
+	}
+	e.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	dropped := 0
+	for _, si := range instances {
+		si.mu.Lock()
+		sess := si.session
+		connected := si.state == state.Connected
+		si.mu.Unlock()
+		if !connected || sess == nil {
+			continue
+		}
+		dropped++
+		wg.Go(func() {
+			stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if err := sess.Stop(stopCtx); err != nil {
+				e.emitLog("warn", fmt.Sprintf("error stopping session: %v", err), si.profile, si.service.Name)
+			}
+		})
+	}
+	wg.Wait()
+	e.emitLog("info", fmt.Sprintf("%s: dropped %d sessions to reconnect", reason, dropped), "", "")
+}
+
 // Status returns the current status of all running services.
 func (e *Engine) Status() []ServiceStatus {
 	e.mu.RLock()

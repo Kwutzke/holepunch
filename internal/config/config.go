@@ -72,7 +72,8 @@ func applyDefaults(cfg *Config) {
 	if cfg.Defaults.Reconnect.MaxBackoffSeconds == 0 {
 		cfg.Defaults.Reconnect.MaxBackoffSeconds = 30
 	}
-	if cfg.Defaults.HealthCheckSeconds == 0 {
+	// It is the network watcher's tick interval, which must be positive.
+	if cfg.Defaults.HealthCheckSeconds <= 0 {
 		cfg.Defaults.HealthCheckSeconds = 10
 	}
 	for profileName, profile := range cfg.Profiles {

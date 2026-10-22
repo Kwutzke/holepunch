@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func Test_discoverFromConfig(t *testing.T) {
+func TestDiscoverFromConfig(t *testing.T) {
 	t.Parallel()
 
 	t.Run("reads nameservers", func(t *testing.T) {
@@ -48,7 +48,7 @@ func Test_discoverFromConfig(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "resolv.conf")
 				require.NoError(t, os.WriteFile(path, []byte(tt.content), 0o644))
 
-				got, err := discoverFromConfig(path, tt.selfAddr)
+				got, err := DiscoverFromConfig(path, tt.selfAddr)
 				require.NoError(t, err)
 				assert.Equal(t, tt.want, got)
 			})
@@ -58,7 +58,7 @@ func Test_discoverFromConfig(t *testing.T) {
 	t.Run("missing file", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := discoverFromConfig(filepath.Join(t.TempDir(), "nope.conf"), "127.0.0.1:15353")
+		_, err := DiscoverFromConfig(filepath.Join(t.TempDir(), "nope.conf"), "127.0.0.1:15353")
 		assert.Error(t, err)
 	})
 }

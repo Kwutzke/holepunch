@@ -117,6 +117,30 @@ profiles:
 		assert.Equal(t, 5, cfg.Defaults.HealthCheckSeconds)
 	})
 
+	t.Run("a negative health check interval takes the default", func(t *testing.T) {
+		t.Parallel()
+
+		yaml := `
+defaults:
+  health_check_interval_seconds: -5
+profiles:
+  dev:
+    aws_profile: dev
+    aws_region: us-east-1
+    target: i-123
+    services:
+      - name: svc
+        dns_name: svc.dev
+        remote_host: host.amazonaws.com
+        remote_port: 443
+`
+
+		cfg, err := config.Parse([]byte(yaml))
+		require.NoError(t, err)
+
+		assert.Equal(t, 10, cfg.Defaults.HealthCheckSeconds)
+	})
+
 	t.Run("validation errors", func(t *testing.T) {
 		t.Parallel()
 

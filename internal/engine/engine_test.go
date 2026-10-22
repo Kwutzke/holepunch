@@ -5,7 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -55,6 +61,57 @@ func (m startMocks) succeedAfterwards(sess *sessionmocks.MockSession) {
 	tcpProxy := enginemocks.NewMockTCPProxy(m.ctrl)
 	tcpProxy.EXPECT().Stop().AnyTimes()
 	m.proxies.EXPECT().NewProxy(gomock.Any(), gomock.Any()).Return(tcpProxy, nil)
+}
+
+// standIns runs an aws stand-in per session whose child never exits, as a dead
+// session-manager-plugin does not, and records both PIDs of each.
+type standIns struct {
+	dir     string
+	started atomic.Int32
+}
+
+func newStandIns(t *testing.T) *standIns {
+	t.Helper()
+	s := &standIns{dir: t.TempDir()}
+	t.Cleanup(func() {
+		for _, pid := range s.readPIDs() {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	return s
+}
+
+func (s *standIns) factory(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+	pidFile := filepath.Join(s.dir, strconv.Itoa(int(s.started.Add(1)))+".pid")
+	return exec.CommandContext(ctx, "sh", "-c", `sleep 300 & echo $$ $! > "$0"; wait`, pidFile)
+}
+
+// pids waits until the first n stand-ins have written their PIDs and returns all of them.
+func (s *standIns) pids(t *testing.T, n int) []int {
+	t.Helper()
+	var pids []int
+	require.Eventually(t, func() bool {
+		pids = s.readPIDs()
+		return len(pids) >= 2*n
+	}, 5*time.Second, 10*time.Millisecond, "stand-ins never wrote their PIDs")
+	return pids
+}
+
+func (s *standIns) readPIDs() []int {
+	files, _ := filepath.Glob(filepath.Join(s.dir, "*.pid"))
+	var pids []int
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil || !strings.HasSuffix(string(b), "\n") {
+			continue
+		}
+		for _, field := range strings.Fields(string(b)) {
+			if pid, err := strconv.Atoi(field); err == nil {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
 }
 
 func TestEngine_Start(t *testing.T) {
@@ -762,6 +819,85 @@ func TestEngine_Stop(t *testing.T) {
 	})
 }
 
+func TestEngine_DropSessions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("every Connected service reconnects on a new session and its old process group is gone", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		ctrl := gomock.NewController(t)
+		standIns := newStandIns(t)
+
+		m := newStartMocks(ctrl)
+		m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		m.dns.EXPECT().RemoveEntries(gomock.Any(), gomock.Any()).Return(nil)
+		m.ips.EXPECT().Allocate(gomock.Any()).Return(testIP, nil).AnyTimes()
+		m.ips.EXPECT().Release(gomock.Any()).AnyTimes()
+
+		eng := engine.New(testConfigMultiService(), m.dns, session.NewSSMManager(standIns.factory), setupMockBastion(ctrl), m.ips, setupMockProxy(ctrl))
+		require.NoError(t, eng.Start(ctx, []string{"dev"}))
+		collectConnected(t, eng.Events(), 2, 5*time.Second)
+		oldGroups := standIns.pids(t, 2)
+
+		eng.DropSessions(ctx, "test network event")
+
+		collectConnected(t, eng.Events(), 2, 10*time.Second)
+		assert.EqualValues(t, 4, standIns.started.Load(), "a second session per service")
+		for _, pid := range oldGroups {
+			assert.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "process %d of a dropped session is alive", pid)
+		}
+		for _, st := range eng.Status() {
+			assert.Equal(t, state.Connected, st.State, st.ServiceName)
+		}
+
+		require.NoError(t, eng.Stop(ctx, nil))
+	})
+
+	t.Run("journey: after a sleep with two failing lookups every service reconnects, and down leaves no stand-in", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		ctrl := gomock.NewController(t)
+		standIns := newStandIns(t)
+
+		m := newStartMocks(ctrl)
+		m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		m.dns.EXPECT().RemoveEntries(gomock.Any(), gomock.Any()).Return(nil)
+		m.ips.EXPECT().Allocate(gomock.Any()).Return(testIP, nil).AnyTimes()
+		m.ips.EXPECT().Release(gomock.Any()).AnyTimes()
+		lookupErr := errors.New("no network yet")
+		m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("i-0abc123", nil).Times(2)
+		m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("", lookupErr).Times(2)
+		m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("i-0abc123", nil).Times(2)
+
+		eng := engine.New(testConfigMultiService(), m.dns, session.NewSSMManager(standIns.factory), m.bastion, m.ips, setupMockProxy(ctrl))
+		require.NoError(t, eng.Start(ctx, []string{"dev"}))
+		collectConnected(t, eng.Events(), 2, 5*time.Second)
+		oldGroups := standIns.pids(t, 2)
+
+		eng.DropSessions(ctx, "host resumed from sleep (10m0s since the last check)")
+		for _, pid := range oldGroups {
+			assert.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "process %d of a dropped session is alive", pid)
+		}
+
+		changes := collectConnected(t, eng.Events(), 2, 15*time.Second)
+		var failedStarts int
+		for _, sc := range changes {
+			if sc.From == state.Starting && sc.To == state.Reconnecting {
+				assert.ErrorIs(t, sc.Error, lookupErr)
+				failedStarts++
+			}
+		}
+		assert.Equal(t, 2, failedStarts, "both failing lookups retried")
+		assert.EqualValues(t, 4, standIns.started.Load(), "the failed lookups started no session")
+
+		allGroups := standIns.pids(t, 4)
+		require.NoError(t, eng.Stop(ctx, nil))
+		for _, pid := range allGroups {
+			assert.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "stand-in process %d outlived down", pid)
+		}
+	})
+}
+
 func TestEngine_Status(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -848,6 +984,16 @@ func testConfigMultiService() config.Config {
 			},
 		},
 	}
+}
+
+// collectConnected returns the state changes up to the n-th move to Connected.
+func collectConnected(t *testing.T, ch <-chan engine.Event, n int, timeout time.Duration) []engine.ServiceStateChanged {
+	t.Helper()
+	var changes []engine.ServiceStateChanged
+	for range n {
+		changes = append(changes, collectStatesUntil(t, ch, state.Connected, timeout)...)
+	}
+	return changes
 }
 
 // collectStatesUntil returns every state change up to and including the first one to target.

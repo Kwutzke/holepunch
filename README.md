@@ -179,7 +179,7 @@ profiles:
                 └───────────────┘
 ```
 
-1. **DNS** — macOS `/etc/resolver/` routes queries for configured TLDs to holepunch's embedded DNS server (port 15353). Each service resolves to a unique `127.0.0.x` address. Every other name under a configured TLD is forwarded to the system's nameservers, so claiming `dev` for `foo.dev` does not black-hole `web.dev`. The daemon reads those nameservers once at startup from `/etc/resolv.conf` (on systemd-resolved hosts, `/run/systemd/resolve/resolv.conf`); with none found, unowned names get an empty answer.
+1. **DNS** — macOS `/etc/resolver/` routes queries for configured TLDs to holepunch's embedded DNS server (port 15353). Each service resolves to a unique `127.0.0.x` address. Every other name under a configured TLD is forwarded to the system's nameservers, so claiming `dev` for `foo.dev` does not black-hole `web.dev`. The daemon reads those nameservers from `/etc/resolv.conf` (on systemd-resolved hosts, `/run/systemd/resolve/resolv.conf`) at startup and again after every network event (see step 6); with none found, unowned names get an empty answer.
 
 2. **Loopback aliases** — `ifconfig lo0 alias 127.0.0.x` creates the addresses. A LaunchDaemon recreates them on reboot.
 
@@ -189,7 +189,7 @@ profiles:
 
 5. **Sigv4 proxy** (optional) — for services with IAM auth (OpenSearch), an HTTP reverse proxy signs every request with AWS credentials before forwarding. Works with browsers, curl, and any HTTP client.
 
-6. **Auto-reconnect** — each service runs an independent state machine. When an SSM session drops, or a start fails (DNS entry, bastion lookup, session start, local listener), holepunch transitions to `Reconnecting`, applies exponential backoff, and retries until the session is restored; `holepunch status` shows the last error meanwhile. Only expired credentials stop a service at `Failed`, until `aws sso login` and a restart.
+6. **Auto-reconnect** — each service runs an independent state machine. When an SSM session drops, or a start fails (DNS entry, bastion lookup, session start, local listener), holepunch transitions to `Reconnecting`, applies exponential backoff, and retries until the session is restored; `holepunch status` shows the last error meanwhile. A dead plugin keeps listening locally, so a session cannot be seen to die after sleep or a network change: holepunch checks every `health_check_interval_seconds` (default 10) whether the wall clock jumped (the host slept) or the local IPv4 addresses changed, and on either restarts every connected session. Only expired credentials stop a service at `Failed`, until `aws sso login` and a restart.
 
 ## Architecture
 
