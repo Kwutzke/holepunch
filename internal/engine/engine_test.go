@@ -23,6 +23,40 @@ import (
 
 var testIP = net.IPv4(127, 0, 0, 2)
 
+// startMocks holds the engine's start-phase dependencies for tests that fail one step on purpose.
+type startMocks struct {
+	ctrl     *gomock.Controller
+	dns      *enginemocks.MockDNSManager
+	sessions *enginemocks.MockSessionManager
+	bastion  *enginemocks.MockBastionResolver
+	ips      *enginemocks.MockIPAllocator
+	proxies  *enginemocks.MockProxyFactory
+}
+
+func newStartMocks(ctrl *gomock.Controller) startMocks {
+	m := startMocks{
+		ctrl:     ctrl,
+		dns:      enginemocks.NewMockDNSManager(ctrl),
+		sessions: enginemocks.NewMockSessionManager(ctrl),
+		bastion:  enginemocks.NewMockBastionResolver(ctrl),
+		ips:      enginemocks.NewMockIPAllocator(ctrl),
+		proxies:  enginemocks.NewMockProxyFactory(ctrl),
+	}
+	m.ips.EXPECT().Allocate("dev/opensearch").Return(testIP, nil).AnyTimes()
+	return m
+}
+
+// succeedAfterwards lets every start step succeed once the expectations set before it are used up,
+// and hands out sess as the session.
+func (m startMocks) succeedAfterwards(sess *sessionmocks.MockSession) {
+	m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("i-0abc123", nil).AnyTimes()
+	m.sessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(sess, nil)
+	tcpProxy := enginemocks.NewMockTCPProxy(m.ctrl)
+	tcpProxy.EXPECT().Stop().AnyTimes()
+	m.proxies.EXPECT().NewProxy(gomock.Any(), gomock.Any()).Return(tcpProxy, nil)
+}
+
 func TestEngine_Start(t *testing.T) {
 	t.Parallel()
 
@@ -406,74 +440,144 @@ func TestEngine_runService(t *testing.T) {
 		close(secondDone)
 	})
 
-	t.Run("bastion resolver error fails service", func(t *testing.T) {
+	t.Run("a transient start failure retries on the backoff until connected", func(t *testing.T) {
 		t.Parallel()
-		ctx := t.Context()
-		ctrl := gomock.NewController(t)
 
-		mockDNS := enginemocks.NewMockDNSManager(ctrl)
-		mockSessions := enginemocks.NewMockSessionManager(ctrl)
-		mockIPs := enginemocks.NewMockIPAllocator(ctrl)
-		mockProxies := setupMockProxy(ctrl)
-		mockBastion := enginemocks.NewMockBastionResolver(ctrl)
+		tests := []struct {
+			name    string
+			failing func(m startMocks, err error)
+		}{
+			{"DNS add", func(m startMocks, err error) {
+				m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(err).Times(2)
+			}},
+			{"bastion lookup", func(m startMocks, err error) {
+				m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("", err).Times(2)
+			}},
+			{"session start", func(m startMocks, err error) {
+				m.sessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(nil, err).Times(2)
+			}},
+			{"proxy listen", func(m startMocks, err error) {
+				failedSession := sessionmocks.NewMockSession(m.ctrl)
+				failedSession.EXPECT().Stop(gomock.Any()).Return(nil).Times(2)
+				m.sessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(failedSession, nil).Times(2)
+				m.proxies.EXPECT().NewProxy(gomock.Any(), gomock.Any()).Return(nil, err).Times(2)
+			}},
+		}
 
-		mockIPs.EXPECT().Allocate("dev/opensearch").Return(testIP, nil).AnyTimes()
-		mockDNS.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil)
-		mockBastion.EXPECT().Resolve(gomock.Any(), gomock.Eq(testConfig().Profiles["dev"])).Return("", errors.New("asg lookup failed"))
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				ctrl := gomock.NewController(t)
 
-		eng := engine.New(testConfig(), mockDNS, mockSessions, mockBastion, mockIPs, mockProxies)
-		require.NoError(t, eng.Start(ctx, []string{"dev"}))
+				startErr := errors.New(tt.name + " unavailable")
+				m := newStartMocks(ctrl)
+				tt.failing(m, startErr)
 
-		sc, found := waitForState(eng.Events(), state.Failed, 2*time.Second)
-		require.True(t, found, "expected Failed event")
-		assert.Contains(t, sc.Error.Error(), "asg lookup failed")
+				sessionDone := make(chan struct{})
+				waited := awaitCalled(t)
+				sess := sessionmocks.NewMockSession(ctrl)
+				sess.EXPECT().Wait().DoAndReturn(func() error {
+					close(waited)
+					<-sessionDone
+					return nil
+				})
+				m.succeedAfterwards(sess)
+
+				eng := engine.New(testConfig(), m.dns, m.sessions, m.bastion, m.ips, m.proxies)
+				require.NoError(t, eng.Start(t.Context(), []string{"dev"}))
+
+				changes := collectStatesUntil(t, eng.Events(), state.Connected, 10*time.Second)
+				close(sessionDone)
+
+				var retries []engine.ServiceStateChanged
+				for _, sc := range changes {
+					assert.NotEqual(t, state.Failed, sc.To, "a transient start failure must not fail the service")
+					if sc.From == state.Starting && sc.To == state.Reconnecting {
+						retries = append(retries, sc)
+					}
+				}
+				require.Len(t, retries, 2, "one retry per failed start")
+				for _, sc := range retries {
+					assert.ErrorIs(t, sc.Error, startErr)
+				}
+			})
+		}
 	})
 
-	t.Run("session start failure", func(t *testing.T) {
+	t.Run("the backoff is capped at max_backoff_seconds", func(t *testing.T) {
 		t.Parallel()
-		ctx := t.Context()
 		ctrl := gomock.NewController(t)
 
-		mockDNS := enginemocks.NewMockDNSManager(ctrl)
-		mockSessions := enginemocks.NewMockSessionManager(ctrl)
-		mockIPs := enginemocks.NewMockIPAllocator(ctrl)
-		mockProxies := setupMockProxy(ctrl)
+		m := newStartMocks(ctrl)
+		m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("", errors.New("asg lookup failed")).AnyTimes()
 
-		mockIPs.EXPECT().Allocate("dev/opensearch").Return(testIP, nil).AnyTimes()
-		mockDNS.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil)
-		mockSessions.EXPECT().Start(gomock.Any(), gomock.Any()).Return(nil, errors.New("aws cli not found"))
+		cfg := testConfig()
+		cfg.Defaults.Reconnect.MaxBackoffSeconds = 1
+		eng := engine.New(cfg, m.dns, m.sessions, m.bastion, m.ips, m.proxies)
+		require.NoError(t, eng.Start(t.Context(), []string{"dev"}))
 
-		eng := engine.New(testConfig(), mockDNS, mockSessions, setupMockBastion(ctrl), mockIPs, mockProxies)
-
-		err := eng.Start(ctx, []string{"dev"})
-		require.NoError(t, err)
-
-		sc, found := waitForState(eng.Events(), state.Failed, 2*time.Second)
-		require.True(t, found, "expected Failed event")
-		assert.Contains(t, sc.Error.Error(), "aws cli not found")
+		var delays []string
+		deadline := time.After(5 * time.Second)
+		for len(delays) < 2 {
+			select {
+			case evt := <-eng.Events():
+				if le, ok := evt.(engine.LogEntry); ok && strings.HasPrefix(le.Message, "reconnecting in") {
+					delays = append(delays, le.Message)
+				}
+			case <-deadline:
+				t.Fatalf("saw %q before the deadline", delays)
+			}
+		}
+		assert.Equal(t, []string{"reconnecting in 1s (attempt 1)", "reconnecting in 1s (attempt 2)"}, delays, "uncapped, the second delay is 2s")
 	})
 
-	t.Run("DNS add failure", func(t *testing.T) {
+	t.Run("down while retrying a failed start ends in Disconnected", func(t *testing.T) {
 		t.Parallel()
-		ctx := t.Context()
 		ctrl := gomock.NewController(t)
 
-		mockDNS := enginemocks.NewMockDNSManager(ctrl)
-		mockSessions := enginemocks.NewMockSessionManager(ctrl)
-		mockIPs := enginemocks.NewMockIPAllocator(ctrl)
-		mockProxies := setupMockProxy(ctrl)
+		m := newStartMocks(ctrl)
+		m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return("", errors.New("asg lookup failed")).AnyTimes()
+		m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		m.dns.EXPECT().RemoveEntries(gomock.Any(), gomock.Any()).Return(nil)
+		m.ips.EXPECT().Release("dev/opensearch")
 
-		mockIPs.EXPECT().Allocate("dev/opensearch").Return(testIP, nil).AnyTimes()
-		mockDNS.EXPECT().Add(gomock.Any(), gomock.Any()).Return(errors.New("permission denied"))
+		eng := engine.New(testConfig(), m.dns, m.sessions, m.bastion, m.ips, m.proxies)
+		require.NoError(t, eng.Start(t.Context(), []string{"dev"}))
+		_, found := waitForState(eng.Events(), state.Reconnecting, 2*time.Second)
+		require.True(t, found, "expected the failed start to retry")
 
-		eng := engine.New(testConfig(), mockDNS, mockSessions, setupMockBastion(ctrl), mockIPs, mockProxies)
+		require.NoError(t, eng.Stop(t.Context(), []string{"dev"}))
 
-		err := eng.Start(ctx, []string{"dev"})
-		require.NoError(t, err)
+		sc, found := waitForState(eng.Events(), state.Disconnected, 2*time.Second)
+		require.True(t, found, "expected Disconnected after down")
+		assert.Equal(t, state.Stopping, sc.From)
+	})
 
-		sc, found := waitForState(eng.Events(), state.Failed, 2*time.Second)
-		require.True(t, found, "expected Failed event on DNS failure")
-		assert.Contains(t, sc.Error.Error(), "permission denied")
+	t.Run("down during a start ends in Disconnected", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+
+		m := newStartMocks(ctrl)
+		resolving := awaitCalled(t)
+		m.bastion.EXPECT().Resolve(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, _ config.Profile) (string, error) {
+			close(resolving)
+			<-ctx.Done()
+			return "", ctx.Err()
+		})
+		m.dns.EXPECT().Add(gomock.Any(), gomock.Any()).Return(nil)
+		m.dns.EXPECT().RemoveEntries(gomock.Any(), gomock.Any()).Return(nil)
+		m.ips.EXPECT().Release("dev/opensearch")
+
+		eng := engine.New(testConfig(), m.dns, m.sessions, m.bastion, m.ips, m.proxies)
+		require.NoError(t, eng.Start(t.Context(), []string{"dev"}))
+		<-resolving
+
+		require.NoError(t, eng.Stop(t.Context(), []string{"dev"}))
+
+		sc, found := waitForState(eng.Events(), state.Disconnected, 2*time.Second)
+		require.True(t, found, "expected Disconnected after down")
+		assert.Equal(t, state.Stopping, sc.From)
 	})
 
 	t.Run("credentials expired halts reconnect", func(t *testing.T) {
@@ -743,6 +847,32 @@ func testConfigMultiService() config.Config {
 				},
 			},
 		},
+	}
+}
+
+// collectStatesUntil returns every state change up to and including the first one to target.
+func collectStatesUntil(t *testing.T, ch <-chan engine.Event, target state.ServiceState, timeout time.Duration) []engine.ServiceStateChanged {
+	t.Helper()
+	var changes []engine.ServiceStateChanged
+	deadline := time.After(timeout)
+	for {
+		select {
+		case evt := <-ch:
+			sc, ok := evt.(engine.ServiceStateChanged)
+			if !ok {
+				continue
+			}
+			changes = append(changes, sc)
+			if sc.To == target {
+				return changes
+			}
+			if sc.To == state.Failed {
+				t.Fatalf("service failed before reaching %v: %v", target, sc.Error)
+			}
+		case <-deadline:
+			t.Fatalf("no transition to %v within %v; saw %v", target, timeout, changes)
+			return nil
+		}
 	}
 }
 

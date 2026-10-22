@@ -23,7 +23,7 @@ $ curl http://opensearch.staging:9443/_cat/indices
 
 - **DNS names instead of localhost** — each service gets a unique `127.0.0.x` loopback IP and a DNS name via an embedded DNS resolver. No `/etc/hosts` manipulation.
 - **Real ports** — connect to `postgres.staging:5432`, not `localhost:29432`. Each service has its own IP, so ports don't conflict.
-- **Auto-reconnect** — SSM sessions drop. Holepunch detects it and reconnects with exponential backoff (1s → 30s). You don't notice.
+- **Auto-reconnect** — SSM sessions drop. Holepunch detects it and reconnects with exponential backoff (1s → 30s, capped by `defaults.reconnect.max_backoff_seconds`). You don't notice.
 - **Multiple profiles** — run staging and prod tunnels simultaneously. Each profile is independent.
 - **Sigv4 signing proxy** — OpenSearch with IAM auth just works. The built-in signing proxy handles AWS request signing transparently, including OpenSearch Dashboards in the browser.
 - **Background daemon** — `holepunch up` launches a daemon and returns. Tunnels stay alive in the background. CLI communicates via unix socket.
@@ -189,7 +189,7 @@ profiles:
 
 5. **Sigv4 proxy** (optional) — for services with IAM auth (OpenSearch), an HTTP reverse proxy signs every request with AWS credentials before forwarding. Works with browsers, curl, and any HTTP client.
 
-6. **Auto-reconnect** — each service runs an independent state machine. When an SSM session drops, holepunch transitions to `Reconnecting`, applies exponential backoff, and retries until the session is restored.
+6. **Auto-reconnect** — each service runs an independent state machine. When an SSM session drops, or a start fails (DNS entry, bastion lookup, session start, local listener), holepunch transitions to `Reconnecting`, applies exponential backoff, and retries until the session is restored; `holepunch status` shows the last error meanwhile. Only expired credentials stop a service at `Failed`, until `aws sso login` and a restart.
 
 ## Architecture
 

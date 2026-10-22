@@ -34,16 +34,15 @@ type ServiceStatus struct {
 
 // Engine orchestrates port-forwarding sessions for all profiles.
 type Engine struct {
-	cfg        config.Config
-	dns        DNSManager
-	sessions   SessionManager
-	bastion    BastionResolver
-	ips        IPAllocator
-	proxies    ProxyFactory
-	events     chan Event
-	mu         sync.RWMutex
-	instances  map[string]*serviceInstance // key: "profile/service"
-	cancelFunc context.CancelFunc
+	cfg       config.Config
+	dns       DNSManager
+	sessions  SessionManager
+	bastion   BastionResolver
+	ips       IPAllocator
+	proxies   ProxyFactory
+	events    chan Event
+	mu        sync.RWMutex
+	instances map[string]*serviceInstance // key: "profile/service"
 }
 
 // New creates a new Engine.
@@ -102,7 +101,7 @@ func (e *Engine) Start(ctx context.Context, selectors []string) error {
 			profile: t.profile,
 			service: t.service,
 			state:   state.Disconnected,
-			backoff: reconnect.NewBackoff(),
+			backoff: e.newBackoff(),
 			localIP: ip.String(),
 		}
 
@@ -216,6 +215,14 @@ func (e *Engine) Status() []ServiceStatus {
 	return statuses
 }
 
+func (e *Engine) newBackoff() *reconnect.Backoff {
+	b := reconnect.NewBackoff()
+	if secs := e.cfg.Defaults.Reconnect.MaxBackoffSeconds; secs > 0 {
+		b.MaxDelay = time.Duration(secs) * time.Second
+	}
+	return b
+}
+
 // resolveTargets expands selector strings into concrete configured
 // services. Each selector is either "profile" (expands to every service
 // in the profile) or "profile/service" (a single service). Returns an
@@ -250,8 +257,6 @@ func (e *Engine) resolveTargets(selectors []string) ([]target, error) {
 }
 
 func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile config.Profile) {
-	key := si.profile + "/" + si.service.Name
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -266,139 +271,61 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 		}
 		e.emitStateChange(si, from, state.Starting, nil)
 
-		ip, _ := e.ips.Allocate(key)
-		err := e.dns.Add(ctx, []dns.Entry{{IP: ip, Hostname: si.service.DNSName}})
+		sess, err := e.connect(ctx, si, profile)
 		if err != nil {
-			e.emitLog("error", fmt.Sprintf("failed to add DNS entry: %v", err), si.profile, si.service.Name)
-			si.mu.Lock()
-			si.lastError = err
-			si.mu.Unlock()
-			_ = si.transition(state.Failed)
-			e.emitStateChange(si, state.Starting, state.Failed, err)
-			return
-		}
-
-		ssmPort, err := freePort()
-		if err != nil {
-			si.mu.Lock()
-			si.lastError = err
-			si.mu.Unlock()
-			_ = si.transition(state.Failed)
-			e.emitStateChange(si, state.Starting, state.Failed, err)
-			return
-		}
-
-		target, err := e.bastion.Resolve(ctx, profile)
-		if err != nil {
-			si.mu.Lock()
-			si.lastError = err
-			si.mu.Unlock()
-			_ = si.transition(state.Failed)
-			e.emitStateChange(si, state.Starting, state.Failed, err)
-			return
-		}
-
-		sess, err := e.sessions.Start(ctx, session.StartParams{
-			AWSProfile: profile.AWSProfile,
-			AWSRegion:  profile.AWSRegion,
-			Target:     target,
-			RemoteHost: si.service.RemoteHost,
-			RemotePort: si.service.RemotePort,
-			LocalIP:    net.IPv4(127, 0, 0, 1),
-			LocalPort:  ssmPort,
-		})
-		if err != nil {
-			si.mu.Lock()
-			si.lastError = err
-			si.mu.Unlock()
-			_ = si.transition(state.Failed)
-			e.emitStateChange(si, state.Starting, state.Failed, err)
-			return
-		}
-
-		listenAddr := fmt.Sprintf("%s:%d", ip.String(), si.service.LocalPort)
-		targetAddr := fmt.Sprintf("127.0.0.1:%d", ssmPort)
-		tcpProxy, err := e.proxies.NewProxy(ctx, ProxyConfig{
-			ListenAddr:   listenAddr,
-			TargetAddr:   targetAddr,
-			Sigv4Service: si.service.Sigv4Service,
-			RealHost:     si.service.RemoteHost,
-			AWSProfile:   profile.AWSProfile,
-			AWSRegion:    profile.AWSRegion,
-		})
-		if err != nil {
-			sess.Stop(ctx)
-			si.mu.Lock()
-			si.lastError = err
-			si.mu.Unlock()
-			_ = si.transition(state.Failed)
-			e.emitStateChange(si, state.Starting, state.Failed, err)
-			return
-		}
-
-		si.mu.Lock()
-		si.session = sess
-		si.tcpProxy = tcpProxy
-		si.mu.Unlock()
-
-		_ = si.transition(state.Connected)
-		si.mu.Lock()
-		si.connectedAt = time.Now()
-		si.mu.Unlock()
-		si.backoff.MarkConnected()
-		e.emitStateChange(si, state.Starting, state.Connected, nil)
-		e.emitLog("info", fmt.Sprintf("connected via %s:%d (ssm port %d)", si.localIP, si.service.LocalPort, ssmPort), si.profile, si.service.Name)
-
-		waitErr := sess.Wait()
-
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		// proxy.Stop waits out in-flight connections, seconds for long-lived clients; under si.mu
-		// that wait would block Status and stopService on this instance.
-		si.mu.Lock()
-		proxy := si.tcpProxy
-		si.tcpProxy = nil
-		si.lastError = waitErr
-		si.session = nil
-		si.mu.Unlock()
-		if proxy != nil {
-			proxy.Stop()
-		}
-
-		if err := si.transition(state.Reconnecting); err != nil {
-			e.emitLog("error", fmt.Sprintf("cannot transition to Reconnecting: %v", err), si.profile, si.service.Name)
-			return
-		}
-		e.emitStateChange(si, state.Connected, state.Reconnecting, waitErr)
-
-		// No retry can succeed until the user runs `aws sso login` and restarts the service.
-		if errors.Is(waitErr, session.ErrCredentialsExpired) {
-			_ = si.transition(state.Failed)
-			e.emitStateChange(si, state.Reconnecting, state.Failed, waitErr)
-			e.emit(CredentialsExpired{
-				Profile:     si.profile,
-				AWSProfile:  profile.AWSProfile,
-				ServiceName: si.service.Name,
-				Detail:      waitErr.Error(),
-				Timestamp:   time.Now(),
-			})
-			e.emitLog("error", fmt.Sprintf("credentials expired for aws profile %q — run: aws sso login --profile %s", profile.AWSProfile, profile.AWSProfile), si.profile, si.service.Name)
-			return
-		}
-
-		if errors.Is(waitErr, session.ErrTargetNotConnected) && profile.TargetASG != "" {
-			e.bastion.Invalidate(profile)
-			e.emitLog("warn", fmt.Sprintf("ssm target rotated out of %s — re-resolving (%v)", profile.TargetASG, waitErr), si.profile, si.service.Name)
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return
-			case <-time.After(targetRotationRetryDelay):
 			}
-			continue
+			if !e.reconnecting(si, state.Starting, err) {
+				return
+			}
+			e.emitLog("warn", fmt.Sprintf("start failed: %v", err), si.profile, si.service.Name)
+		} else {
+			waitErr := sess.Wait()
+			if ctx.Err() != nil {
+				return
+			}
+
+			// proxy.Stop waits out in-flight connections, seconds for long-lived clients; under si.mu
+			// that wait would block Status and stopService on this instance.
+			si.mu.Lock()
+			proxy := si.tcpProxy
+			si.tcpProxy = nil
+			si.session = nil
+			si.mu.Unlock()
+			if proxy != nil {
+				proxy.Stop()
+			}
+
+			if !e.reconnecting(si, state.Connected, waitErr) {
+				return
+			}
+
+			// No retry can succeed until the user runs `aws sso login` and restarts the service.
+			if errors.Is(waitErr, session.ErrCredentialsExpired) {
+				_ = si.transition(state.Failed)
+				e.emitStateChange(si, state.Reconnecting, state.Failed, waitErr)
+				e.emit(CredentialsExpired{
+					Profile:     si.profile,
+					AWSProfile:  profile.AWSProfile,
+					ServiceName: si.service.Name,
+					Detail:      waitErr.Error(),
+					Timestamp:   time.Now(),
+				})
+				e.emitLog("error", fmt.Sprintf("credentials expired for aws profile %q — run: aws sso login --profile %s", profile.AWSProfile, profile.AWSProfile), si.profile, si.service.Name)
+				return
+			}
+
+			if errors.Is(waitErr, session.ErrTargetNotConnected) && profile.TargetASG != "" {
+				e.bastion.Invalidate(profile)
+				e.emitLog("warn", fmt.Sprintf("ssm target rotated out of %s — re-resolving (%v)", profile.TargetASG, waitErr), si.profile, si.service.Name)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(targetRotationRetryDelay):
+				}
+				continue
+			}
 		}
 
 		if si.backoff.ShouldReset() {
@@ -416,6 +343,84 @@ func (e *Engine) runService(ctx context.Context, si *serviceInstance, profile co
 	}
 }
 
+// connect runs every start step and leaves the service Connected with its session and proxy stored;
+// on error the service is still Starting and holds neither.
+func (e *Engine) connect(ctx context.Context, si *serviceInstance, profile config.Profile) (session.Session, error) {
+	ip, _ := e.ips.Allocate(si.profile + "/" + si.service.Name)
+	if err := e.dns.Add(ctx, []dns.Entry{{IP: ip, Hostname: si.service.DNSName}}); err != nil {
+		return nil, fmt.Errorf("adding DNS entry: %w", err)
+	}
+
+	ssmPort, err := freePort()
+	if err != nil {
+		return nil, err
+	}
+
+	target, err := e.bastion.Resolve(ctx, profile)
+	if err != nil {
+		return nil, fmt.Errorf("resolving SSM target: %w", err)
+	}
+
+	sess, err := e.sessions.Start(ctx, session.StartParams{
+		AWSProfile: profile.AWSProfile,
+		AWSRegion:  profile.AWSRegion,
+		Target:     target,
+		RemoteHost: si.service.RemoteHost,
+		RemotePort: si.service.RemotePort,
+		LocalIP:    net.IPv4(127, 0, 0, 1),
+		LocalPort:  ssmPort,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tcpProxy, err := e.proxies.NewProxy(ctx, ProxyConfig{
+		ListenAddr:   fmt.Sprintf("%s:%d", ip.String(), si.service.LocalPort),
+		TargetAddr:   fmt.Sprintf("127.0.0.1:%d", ssmPort),
+		Sigv4Service: si.service.Sigv4Service,
+		RealHost:     si.service.RemoteHost,
+		AWSProfile:   profile.AWSProfile,
+		AWSRegion:    profile.AWSRegion,
+	})
+	if err != nil {
+		stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if stopErr := sess.Stop(stopCtx); stopErr != nil {
+			e.emitLog("warn", fmt.Sprintf("error stopping session: %v", stopErr), si.profile, si.service.Name)
+		}
+		return nil, fmt.Errorf("starting proxy: %w", err)
+	}
+
+	si.mu.Lock()
+	si.session = sess
+	si.tcpProxy = tcpProxy
+	si.lastError = nil
+	si.mu.Unlock()
+
+	_ = si.transition(state.Connected)
+	si.mu.Lock()
+	si.connectedAt = time.Now()
+	si.mu.Unlock()
+	si.backoff.MarkConnected()
+	e.emitStateChange(si, state.Starting, state.Connected, nil)
+	e.emitLog("info", fmt.Sprintf("connected via %s:%d (ssm port %d)", si.localIP, si.service.LocalPort, ssmPort), si.profile, si.service.Name)
+	return sess, nil
+}
+
+// reconnecting records err as the service's last error and moves it to Reconnecting. It reports
+// false when the move is refused, which ends the service loop.
+func (e *Engine) reconnecting(si *serviceInstance, from state.ServiceState, err error) bool {
+	si.mu.Lock()
+	si.lastError = err
+	si.mu.Unlock()
+	if terr := si.transition(state.Reconnecting); terr != nil {
+		e.emitLog("error", fmt.Sprintf("cannot transition to Reconnecting: %v", terr), si.profile, si.service.Name)
+		return false
+	}
+	e.emitStateChange(si, from, state.Reconnecting, err)
+	return true
+}
+
 func (e *Engine) stopService(ctx context.Context, si *serviceInstance) {
 	si.cancel()
 
@@ -425,8 +430,11 @@ func (e *Engine) stopService(ctx context.Context, si *serviceInstance) {
 	si.mu.Unlock()
 
 	if currentState != state.Disconnected && currentState != state.Stopping {
-		_ = si.transition(state.Stopping)
-		e.emitStateChange(si, currentState, state.Stopping, nil)
+		if err := si.transition(state.Stopping); err != nil {
+			e.emitLog("warn", fmt.Sprintf("cannot transition to Stopping: %v", err), si.profile, si.service.Name)
+		} else {
+			e.emitStateChange(si, currentState, state.Stopping, nil)
+		}
 	}
 
 	if sess != nil {
@@ -445,7 +453,10 @@ func (e *Engine) stopService(ctx context.Context, si *serviceInstance) {
 		proxy.Stop()
 	}
 
-	_ = si.transition(state.Disconnected)
+	if err := si.transition(state.Disconnected); err != nil {
+		e.emitLog("warn", fmt.Sprintf("cannot transition to Disconnected: %v", err), si.profile, si.service.Name)
+		return
+	}
 	e.emitStateChange(si, state.Stopping, state.Disconnected, nil)
 }
 
@@ -522,6 +533,8 @@ func freePort() (int, error) {
 		return 0, fmt.Errorf("finding free port: %w", err)
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	if err := l.Close(); err != nil {
+		return 0, fmt.Errorf("releasing free port: %w", err)
+	}
 	return port, nil
 }

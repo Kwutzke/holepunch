@@ -2,6 +2,24 @@ package state
 
 import "fmt"
 
+var stateNames = map[ServiceState]string{
+	Disconnected: "Disconnected",
+	Starting:     "Starting",
+	Connected:    "Connected",
+	Reconnecting: "Reconnecting",
+	Failed:       "Failed",
+	Stopping:     "Stopping",
+}
+
+var allowedTransitions = map[ServiceState]map[ServiceState]bool{
+	Disconnected: {Starting: true},
+	Starting:     {Connected: true, Reconnecting: true, Failed: true, Stopping: true},
+	Connected:    {Reconnecting: true, Stopping: true},
+	Reconnecting: {Starting: true, Failed: true, Stopping: true},
+	Failed:       {Starting: true, Stopping: true},
+	Stopping:     {Disconnected: true},
+}
+
 // ServiceState represents the current state of a port-forwarding service.
 type ServiceState int
 
@@ -14,29 +32,11 @@ const (
 	Stopping
 )
 
-var stateNames = map[ServiceState]string{
-	Disconnected: "Disconnected",
-	Starting:     "Starting",
-	Connected:    "Connected",
-	Reconnecting: "Reconnecting",
-	Failed:       "Failed",
-	Stopping:     "Stopping",
-}
-
 func (s ServiceState) String() string {
 	if name, ok := stateNames[s]; ok {
 		return name
 	}
 	return fmt.Sprintf("Unknown(%d)", int(s))
-}
-
-var allowedTransitions = map[ServiceState]map[ServiceState]bool{
-	Disconnected: {Starting: true},
-	Starting:     {Connected: true, Failed: true},
-	Connected:    {Reconnecting: true, Stopping: true},
-	Reconnecting: {Starting: true, Failed: true, Stopping: true},
-	Failed:       {Starting: true, Stopping: true},
-	Stopping:     {Disconnected: true},
 }
 
 // Transition validates that moving from one state to another is allowed.
