@@ -1,9 +1,4 @@
-// Package tray implements the macOS menu bar UI for holepunch. It reads the
-// daemon's typed event stream, reflects service state in a flat clickable
-// menu, and surfaces credential-expiry as a clickable "Login" item.
-//
-// The tray runs in-process as a cobra subcommand (holepunch tray) and
-// requires the OS main thread (systray uses NSApplicationMain on darwin).
+// Package tray is holepunch's macOS menu-bar UI, driven by the daemon's event stream.
 package tray
 
 import (
@@ -20,8 +15,6 @@ import (
 
 	"github.com/Kwutzke/holepunch/internal/daemon"
 )
-
-// --- embedded icons -------------------------------------------------------
 
 //go:embed icons/idle.png
 var iconIdle []byte
@@ -49,34 +42,6 @@ const (
 	stateWarn
 	stateErr
 )
-
-// iconFor returns the PNG bytes for the given aggregate state.
-func iconFor(s iconState) []byte {
-	switch s {
-	case stateOK:
-		return iconOK
-	case statePartial:
-		return iconPartial
-	case stateWarn:
-		return iconWarn
-	case stateErr:
-		return iconErr
-	default:
-		return iconIdle
-	}
-}
-
-// --- entry point ----------------------------------------------------------
-
-// Run blocks the calling goroutine on systray.Run. Caller is responsible
-// for pinning the OS thread via runtime.LockOSThread before invoking this,
-// otherwise NSApplicationMain will be on a non-main thread on darwin.
-func Run(socketPath string) {
-	t := newTray(socketPath)
-	systray.Run(t.onReady, t.onExit)
-}
-
-// --- internal state -------------------------------------------------------
 
 type serviceEntry struct {
 	profile     string
@@ -106,12 +71,8 @@ type tray struct {
 	profiles map[string]*profileEntry
 	built    bool // true once the profile section of the menu has been rendered
 
-	// eventSeq increments every time apply() mutates service state. Seeds
-	// capture this before the RTT; if it changed by the time the seed
-	// applies, state fields are left alone (events are authoritative and
-	// more recent than the snapshot). This both avoids the seed-vs-event
-	// race and lets a seed recover from an event that was dropped by the
-	// bus (eventSeq didn't tick, so the seed is safe to apply fully).
+	// eventSeq lets a seed detect events that landed during its round trip:
+	// those outrank the snapshot, while an event the bus dropped never ticks it.
 	eventSeq uint64
 
 	// bottom-level menu handles
@@ -137,17 +98,12 @@ func newTray(socketPath string) *tray {
 	}
 }
 
-// --- systray lifecycle ----------------------------------------------------
-
 func (t *tray) onReady() {
 	systray.SetIcon(iconFor(stateIdle))
 	systray.SetTitle("")
 	systray.SetTooltip("holepunch")
 
-	// Seed synchronously BEFORE building the menu so profile+service items
-	// appear above the static actions. systray has no insert-before, so
-	// anything discovered later in this session is a no-op (user must
-	// restart the tray after config changes).
+	// systray cannot insert above existing items, so only what this seed finds gets a row.
 	t.seedStatuses()
 	t.buildProfilesMenu()
 	t.buildStaticMenu()
@@ -306,15 +262,7 @@ func (t *tray) watchLoginClick(p *profileEntry) {
 	}
 }
 
-// seedStatuses pulls the current status snapshot.
-//
-// Captures eventSeq before the daemon RTT. On return, if eventSeq is
-// unchanged, no events landed during the RTT so the snapshot is
-// authoritative and state/err are adopted. If events did land, the
-// snapshot predates them; we only adopt DNSName/LocalAddr (which aren't
-// carried on state events) and leave state alone.
-//
-// Returns false when the daemon is unreachable or errors.
+// seedStatuses reports false when the daemon is unreachable; streamDaemon uses it as its liveness probe.
 func (t *tray) seedStatuses() bool {
 	client := daemon.NewClient(t.socketPath)
 
@@ -348,9 +296,7 @@ func (t *tray) seedStatuses() bool {
 			svc.err = st.Error
 		}
 	}
-	// Items that existed before but aren't in the snapshot: mark
-	// Disconnected. Only safe when no events interleaved — otherwise the
-	// event that created this entry may be newer than the snapshot.
+	// Absent from the snapshot means Disconnected only if no newer event created the entry.
 	if safe {
 		for pname, p := range t.profiles {
 			for sname, svc := range p.services {
@@ -367,11 +313,12 @@ func (t *tray) seedStatuses() bool {
 	return true
 }
 
-// --- daemon stream --------------------------------------------------------
-
 func (t *tray) streamDaemon() {
 	client := daemon.NewClient(t.socketPath)
 	backoff := time.Second
+	// Outlasts a `holepunch restart` (3–5s), so only a real shutdown quits the UI.
+	var firstFailAt time.Time
+	const daemonGraceWindow = 10 * time.Second
 	for {
 		select {
 		case <-t.stopCh:
@@ -379,10 +326,14 @@ func (t *tray) streamDaemon() {
 		default:
 		}
 
-		// Probe + re-seed via CmdStatus. Doubles as a liveness check so
-		// we can reset backoff on the happy path and pick up any state
-		// we missed while disconnected.
 		if !t.seedStatuses() {
+			if firstFailAt.IsZero() {
+				firstFailAt = time.Now()
+			} else if time.Since(firstFailAt) > daemonGraceWindow {
+				log.Printf("tray: daemon unreachable for %v, quitting", daemonGraceWindow)
+				systray.Quit()
+				return
+			}
 			select {
 			case <-t.stopCh:
 				return
@@ -393,6 +344,7 @@ func (t *tray) streamDaemon() {
 			}
 			continue
 		}
+		firstFailAt = time.Time{}
 		backoff = time.Second
 
 		err := client.StreamEvents(daemon.Request{Command: daemon.CmdTrayRegister}, func(env *daemon.EventEnvelope) bool {
@@ -509,8 +461,6 @@ func (t *tray) getOrCreateProfileLocked(name string) *profileEntry {
 	return p
 }
 
-// --- debounced menu refresh ----------------------------------------------
-
 func (t *tray) triggerRefresh() {
 	select {
 	case t.refresh <- struct{}{}:
@@ -572,6 +522,84 @@ func (t *tray) rebuild() {
 	systray.SetIcon(iconFor(t.aggregateStateLocked()))
 }
 
+func (t *tray) aggregateStateLocked() iconState {
+	var anyConnected, anyDisconnected, anyInFlight bool
+
+	for _, p := range t.profiles {
+		if p.credsExpired {
+			return stateErr
+		}
+		for _, svc := range p.services {
+			switch svc.state {
+			case "Failed":
+				return stateErr
+			case "Starting", "Reconnecting", "Stopping":
+				anyInFlight = true
+			case "Connected":
+				anyConnected = true
+			case "", "Disconnected":
+				anyDisconnected = true
+			}
+		}
+	}
+	if anyInFlight {
+		return stateWarn
+	}
+	if anyConnected && anyDisconnected {
+		return statePartial
+	}
+	if anyConnected {
+		return stateOK
+	}
+	return stateIdle
+}
+
+// openLogsTerminal opens a new Terminal window running `holepunch logs -f`.
+func (t *tray) openLogsTerminal() {
+	script := fmt.Sprintf(`tell application "Terminal" to do script "holepunch --socket %s logs -f"`, t.socketPath)
+	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
+		log.Printf("tray: open logs: %v", err)
+	}
+}
+
+// openLoginTerminal opens a Terminal window running `aws sso login` for the
+// given AWS profile. This is the non-clickable-notification fallback path;
+// PR3 will replace it with terminal-notifier -execute for in-notification
+// action.
+func (t *tray) openLoginTerminal(awsProfile string) {
+	if awsProfile == "" {
+		return
+	}
+	script := fmt.Sprintf(`tell application "Terminal" to do script "aws sso login --profile %s"`, awsProfile)
+	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
+		log.Printf("tray: open login: %v", err)
+	}
+}
+
+// Run blocks the calling goroutine on systray.Run. Caller is responsible
+// for pinning the OS thread via runtime.LockOSThread before invoking this,
+// otherwise NSApplicationMain will be on a non-main thread on darwin.
+func Run(socketPath string) {
+	t := newTray(socketPath)
+	systray.Run(t.onReady, t.onExit)
+}
+
+// iconFor returns the PNG bytes for the given aggregate state.
+func iconFor(s iconState) []byte {
+	switch s {
+	case stateOK:
+		return iconOK
+	case statePartial:
+		return iconPartial
+	case stateWarn:
+		return iconWarn
+	case stateErr:
+		return iconErr
+	default:
+		return iconIdle
+	}
+}
+
 // serviceLabel renders a single-line status for a service row as
 // "marker  dns:port". Failed services append the error text after an em
 // dash. The port comes from config (seeded via StatusEntry.LocalPort) so
@@ -605,68 +633,5 @@ func stateMarker(s string) string {
 		return "◌"
 	default:
 		return "○"
-	}
-}
-
-// aggregateStateLocked computes the icon state across every service.
-// Rules:
-//   - any creds_expired or Failed → err
-//   - any Starting/Reconnecting/Stopping (in-flight) → warn
-//   - some Connected AND some Disconnected → partial (green ring)
-//   - all Connected → ok (green filled)
-//   - nothing connected and nothing in flight → idle
-func (t *tray) aggregateStateLocked() iconState {
-	var anyConnected, anyDisconnected, anyInFlight bool
-
-	for _, p := range t.profiles {
-		if p.credsExpired {
-			return stateErr
-		}
-		for _, svc := range p.services {
-			switch svc.state {
-			case "Failed":
-				return stateErr
-			case "Starting", "Reconnecting", "Stopping":
-				anyInFlight = true
-			case "Connected":
-				anyConnected = true
-			case "", "Disconnected":
-				anyDisconnected = true
-			}
-		}
-	}
-	if anyInFlight {
-		return stateWarn
-	}
-	if anyConnected && anyDisconnected {
-		return statePartial
-	}
-	if anyConnected {
-		return stateOK
-	}
-	return stateIdle
-}
-
-// --- shell-out helpers ----------------------------------------------------
-
-// openLogsTerminal opens a new Terminal window running `holepunch logs -f`.
-func (t *tray) openLogsTerminal() {
-	script := fmt.Sprintf(`tell application "Terminal" to do script "holepunch --socket %s logs -f"`, t.socketPath)
-	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
-		log.Printf("tray: open logs: %v", err)
-	}
-}
-
-// openLoginTerminal opens a Terminal window running `aws sso login` for the
-// given AWS profile. This is the non-clickable-notification fallback path;
-// PR3 will replace it with terminal-notifier -execute for in-notification
-// action.
-func (t *tray) openLoginTerminal(awsProfile string) {
-	if awsProfile == "" {
-		return
-	}
-	script := fmt.Sprintf(`tell application "Terminal" to do script "aws sso login --profile %s"`, awsProfile)
-	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
-		log.Printf("tray: open login: %v", err)
 	}
 }

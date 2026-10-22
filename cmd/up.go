@@ -94,9 +94,19 @@ func launchDaemon() error {
 		return err
 	}
 
+	logFile, err := daemon.OpenLog(daemon.DefaultLogPath())
+	if err != nil {
+		return err
+	}
+
+	// The aws children inherit the daemon's stderr, so their output lands in the log too.
 	cmd := exec.Command(exe, "daemon", "--socket", socketPath, "--config", configPath)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 	cmd.SysProcAttr = &sysProcAttr
-	return cmd.Start()
+	startErr := cmd.Start()
+	if err := logFile.Close(); err != nil && startErr == nil {
+		return fmt.Errorf("closing daemon log: %w", err)
+	}
+	return startErr
 }

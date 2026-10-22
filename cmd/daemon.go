@@ -7,15 +7,18 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/spf13/cobra"
+	"github.com/Kwutzke/holepunch/internal/bastion"
 	"github.com/Kwutzke/holepunch/internal/config"
 	"github.com/Kwutzke/holepunch/internal/daemon"
 	"github.com/Kwutzke/holepunch/internal/engine"
 	"github.com/Kwutzke/holepunch/internal/ip"
+	"github.com/Kwutzke/holepunch/internal/netwatch"
 	"github.com/Kwutzke/holepunch/internal/proxy"
 	"github.com/Kwutzke/holepunch/internal/resolver"
 	"github.com/Kwutzke/holepunch/internal/session"
+	"github.com/spf13/cobra"
 )
 
 const defaultResolverAddr = "127.0.0.1:15353"
@@ -32,6 +35,27 @@ var daemonCmd = &cobra.Command{
 func init() {
 	daemonCmd.Flags().StringVar(&configPath, "config", config.DefaultConfigPath(), "path to config file")
 	rootCmd.AddCommand(daemonCmd)
+}
+
+// realProxyFactory implements engine.ProxyFactory using real TCP or sigv4 proxies.
+type realProxyFactory struct{}
+
+func (realProxyFactory) NewProxy(ctx context.Context, cfg engine.ProxyConfig) (engine.TCPProxy, error) {
+	if cfg.Sigv4Service != "" {
+		p := proxy.NewSigv4Proxy(proxy.Sigv4Config{
+			ListenAddr: cfg.ListenAddr,
+			TargetAddr: cfg.TargetAddr,
+			RealHost:   cfg.RealHost,
+			AWSProfile: cfg.AWSProfile,
+			AWSRegion:  cfg.AWSRegion,
+			AWSService: cfg.Sigv4Service,
+		})
+		if err := p.Start(ctx); err != nil {
+			return nil, err
+		}
+		return p, nil
+	}
+	return proxy.StartNew(ctx, cfg.ListenAddr, cfg.TargetAddr)
 }
 
 func runDaemon(_ *cobra.Command, _ []string) error {
@@ -57,9 +81,14 @@ func runDaemon(_ *cobra.Command, _ []string) error {
 
 	dnsMgr := resolver.NewDNSAdapter(dnsResolver)
 	sessMgr := session.NewSSMManager(nil)
+	bastionResolver := bastion.NewASGResolver()
 	ipAlloc := ip.New()
 
-	eng := engine.New(cfg, dnsMgr, sessMgr, ipAlloc, realProxyFactory{})
+	eng := engine.New(cfg, dnsMgr, sessMgr, bastionResolver, ipAlloc, realProxyFactory{})
+	network := daemon.NewNetworkFollower(eng, dnsResolver, func() ([]string, error) {
+		return resolver.DiscoverSystemResolvers(defaultResolverAddr)
+	})
+	network.RefreshUpstream()
 
 	srv, err := daemon.NewServer(socketPath, eng)
 	if err != nil {
@@ -69,9 +98,17 @@ func runDaemon(_ *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Forward engine events to log output.
+	watcher := netwatch.New(time.Duration(cfg.Defaults.HealthCheckSeconds) * time.Second)
+	go watcher.Run(ctx)
+	go network.Follow(ctx, watcher.Events())
+
+	// Forward engine events to log output via the Server's Bus. The Bus is
+	// the single consumer of eng.Events(); draining the raw channel here as
+	// well would split events between consumers and starve RPC subscribers.
+	logEvents, cancelLogs := srv.Subscribe()
+	defer cancelLogs()
 	go func() {
-		for evt := range eng.Events() {
+		for evt := range logEvents {
 			switch e := evt.(type) {
 			case engine.ServiceStateChanged:
 				msg := fmt.Sprintf("[%s/%s] %s -> %s", e.Profile, e.ServiceName, e.From, e.To)
@@ -99,25 +136,4 @@ func runDaemon(_ *cobra.Command, _ []string) error {
 
 	log.Printf("daemon starting on %s", socketPath)
 	return srv.Serve(ctx)
-}
-
-// realProxyFactory implements engine.ProxyFactory using real TCP or sigv4 proxies.
-type realProxyFactory struct{}
-
-func (realProxyFactory) NewProxy(ctx context.Context, cfg engine.ProxyConfig) (engine.TCPProxy, error) {
-	if cfg.Sigv4Service != "" {
-		p := proxy.NewSigv4Proxy(proxy.Sigv4Config{
-			ListenAddr: cfg.ListenAddr,
-			TargetAddr: cfg.TargetAddr,
-			RealHost:   cfg.RealHost,
-			AWSProfile: cfg.AWSProfile,
-			AWSRegion:  cfg.AWSRegion,
-			AWSService: cfg.Sigv4Service,
-		})
-		if err := p.Start(ctx); err != nil {
-			return nil, err
-		}
-		return p, nil
-	}
-	return proxy.StartNew(ctx, cfg.ListenAddr, cfg.TargetAddr)
 }

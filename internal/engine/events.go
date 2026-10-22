@@ -19,7 +19,7 @@ type ServiceStateChanged struct {
 	DNSName     string
 	From        state.ServiceState
 	To          state.ServiceState
-	Error       error // non-nil when transitioning to Failed
+	Error       error // the failure behind a move to Reconnecting or Failed
 	Timestamp   time.Time
 }
 

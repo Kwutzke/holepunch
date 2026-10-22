@@ -23,7 +23,7 @@ $ curl http://opensearch.staging:9443/_cat/indices
 
 - **DNS names instead of localhost** — each service gets a unique `127.0.0.x` loopback IP and a DNS name via an embedded DNS resolver. No `/etc/hosts` manipulation.
 - **Real ports** — connect to `postgres.staging:5432`, not `localhost:29432`. Each service has its own IP, so ports don't conflict.
-- **Auto-reconnect** — SSM sessions drop. Holepunch detects it and reconnects with exponential backoff (1s → 30s). You don't notice.
+- **Auto-reconnect** — SSM sessions drop. Holepunch detects it and reconnects with exponential backoff (1s → 30s, capped by `defaults.reconnect.max_backoff_seconds`). You don't notice.
 - **Multiple profiles** — run staging and prod tunnels simultaneously. Each profile is independent.
 - **Sigv4 signing proxy** — OpenSearch with IAM auth just works. The built-in signing proxy handles AWS request signing transparently, including OpenSearch Dashboards in the browser.
 - **Background daemon** — `holepunch up` launches a daemon and returns. Tunnels stay alive in the background. CLI communicates via unix socket.
@@ -124,7 +124,7 @@ holepunch down            # stop all + kill daemon
 | `holepunch down -f` | Force kill an unresponsive daemon. |
 | `holepunch restart` | Stop everything, restart daemon, reconnect all profiles. |
 | `holepunch status` | Show connection states, addresses, uptime, errors. |
-| `holepunch logs -f` | Stream daemon events (connections, reconnects, errors). |
+| `holepunch logs -f` | Stream daemon events (connections, reconnects, errors). The daemon's full output, including `aws` errors, is appended to `~/.holepunch/daemon.log`, which moves to `daemon.log.1` at launch once above 10 MiB. |
 | `holepunch setup` | One-time setup: DNS resolver files + loopback aliases (needs sudo). |
 | `holepunch unsetup` | Remove all setup artifacts. |
 
@@ -135,7 +135,8 @@ profiles:
   <profile-name>:
     aws_profile: <string>       # AWS CLI profile (supports SSO)
     aws_region: <string>        # AWS region
-    target: <string>            # SSM-managed EC2 instance ID (bastion)
+    target: <string>            # SSM-managed EC2 instance ID (bastion); or:
+    target_asg: <string>        # Auto Scaling group whose instances act as the bastion
     services:
       - name: <string>          # service identifier
         dns_name: <string>      # local DNS name (e.g. "postgres.staging")
@@ -151,6 +152,7 @@ profiles:
 - **`sigv4_service`** — when set, holepunch runs an HTTP reverse proxy that signs every request with your AWS credentials (resolved from `aws_profile`). Required for IAM-authenticated OpenSearch. Set to `es` for OpenSearch/Elasticsearch Service.
 - **`dns_name`** — fully configurable. The TLD determines which `/etc/resolver/` file is created during setup. Multiple TLDs are supported.
 - **`target`** — the SSM-managed EC2 instance used as the tunnel endpoint. Must have network access to the `remote_host`. Typically a bastion or ECS instance in the same VPC.
+- **`target_asg`** — use instead of `target` when the bastion is replaced by an Auto Scaling group (AMI refresh, patching), so a pinned instance ID would go stale. Exactly one of `target` and `target_asg` is required. holepunch picks an `InService` instance that SSM reports `Online`, caches it, and picks again when SSM says the instance is no longer connected. The lookup needs `autoscaling:DescribeAutoScalingGroups` and `ssm:DescribeInstanceInformation` for `aws_profile`.
 
 ## How it works
 
@@ -177,17 +179,17 @@ profiles:
                 └───────────────┘
 ```
 
-1. **DNS** — macOS `/etc/resolver/` routes queries for configured TLDs to holepunch's embedded DNS server (port 15353). Each service resolves to a unique `127.0.0.x` address.
+1. **DNS** — macOS `/etc/resolver/` routes queries for configured TLDs to holepunch's embedded DNS server (port 15353). Each service resolves to a unique `127.0.0.x` address. Every other name under a configured TLD is forwarded to the system's nameservers, so claiming `dev` for `foo.dev` does not black-hole `web.dev`. The daemon reads those nameservers from `/etc/resolv.conf` (on systemd-resolved hosts, `/run/systemd/resolve/resolv.conf`) at startup and again after every network event (see step 6); with none found, unowned names get an empty answer.
 
 2. **Loopback aliases** — `ifconfig lo0 alias 127.0.0.x` creates the addresses. A LaunchDaemon recreates them on reboot.
 
-3. **SSM tunnel** — `aws ssm start-session` opens a port-forwarding session through the bastion to the remote service. Binds to `127.0.0.1:<random-high-port>`.
+3. **SSM tunnel** — `aws ssm start-session` opens a port-forwarding session through the bastion to the remote service. Binds to `127.0.0.1:<random-high-port>`. `aws` runs as the leader of its own process group, and stopping a session terminates the whole group, so `session-manager-plugin` exits with it. `holepunch down -f` kills the daemon with SIGKILL, which leaves each running group behind.
 
 4. **TCP proxy** — listens on `127.0.0.x:<real-port>` and forwards to the SSM tunnel on `127.0.0.1:<random-port>`. This bridges the unique IP to the SSM-bound port.
 
 5. **Sigv4 proxy** (optional) — for services with IAM auth (OpenSearch), an HTTP reverse proxy signs every request with AWS credentials before forwarding. Works with browsers, curl, and any HTTP client.
 
-6. **Auto-reconnect** — each service runs an independent state machine. When an SSM session drops, holepunch transitions to `Reconnecting`, applies exponential backoff, and retries until the session is restored.
+6. **Auto-reconnect** — each service runs an independent state machine. When an SSM session drops, or a start fails (DNS entry, bastion lookup, session start, local listener), holepunch transitions to `Reconnecting`, applies exponential backoff, and retries until the session is restored; `holepunch status` shows the last error meanwhile. A dead plugin keeps listening locally, so a session cannot be seen to die after sleep or a network change: holepunch checks every `health_check_interval_seconds` (default 10) whether the wall clock jumped (the host slept) or the local IPv4 addresses changed, and on either restarts every connected session. Only expired credentials stop a service at `Failed`, until `aws sso login` and a restart.
 
 ## Architecture
 
@@ -195,6 +197,7 @@ profiles:
 cmd/              CLI layer (cobra) — thin, delegates to daemon
 internal/
   config/         YAML config parsing + validation
+  bastion/        SSM target lookup from an Auto Scaling group (target_asg)
   state/          Service state machine with transition validation
   reconnect/      Exponential backoff calculator
   ip/             Deterministic loopback IP allocator (FNV hash)

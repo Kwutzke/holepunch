@@ -25,7 +25,6 @@ type Server struct {
 
 // NewServer creates a daemon server bound to the given socket path.
 func NewServer(socketPath string, eng *engine.Engine) (*Server, error) {
-	// Remove stale socket if it exists.
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("removing stale socket: %w", err)
 	}
@@ -45,11 +44,10 @@ func NewServer(socketPath string, eng *engine.Engine) (*Server, error) {
 	return s, nil
 }
 
-// hasTrayClientLoad exposes the tray-client counter to the notifier as a
-// closure-friendly reader (avoids the notifier importing atomic state from
-// Server directly).
-func (s *Server) hasTrayClientLoad() bool {
-	return s.hasTrayClient.Load() > 0
+// Subscribe is the only safe way to watch engine events: the Bus already reads
+// eng.Events(), so a second reader of that channel would split events with it.
+func (s *Server) Subscribe() (<-chan engine.Event, func()) {
+	return s.bus.Subscribe()
 }
 
 // Serve starts accepting connections. Blocks until the context is cancelled.
@@ -83,6 +81,10 @@ func (s *Server) Serve(ctx context.Context) error {
 // SocketPath returns the path the server is listening on.
 func (s *Server) SocketPath() string {
 	return s.listener.Addr().String()
+}
+
+func (s *Server) hasTrayClientLoad() bool {
+	return s.hasTrayClient.Load() > 0
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
@@ -179,7 +181,6 @@ func (s *Server) handleLogs(ctx context.Context, conn net.Conn, req Request) {
 	events, cancel := s.bus.Subscribe()
 	defer cancel()
 
-	// Send initial OK response.
 	if err := writeMessage(conn, Response{OK: true}); err != nil {
 		return
 	}

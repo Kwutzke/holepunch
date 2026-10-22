@@ -19,6 +19,8 @@ func TestTransition(t *testing.T) {
 		{"Disconnected to Starting", state.Disconnected, state.Starting},
 		{"Starting to Connected", state.Starting, state.Connected},
 		{"Starting to Failed", state.Starting, state.Failed},
+		{"Starting to Reconnecting", state.Starting, state.Reconnecting},
+		{"Starting to Stopping", state.Starting, state.Stopping},
 		{"Connected to Reconnecting", state.Connected, state.Reconnecting},
 		{"Connected to Stopping", state.Connected, state.Stopping},
 		{"Reconnecting to Starting", state.Reconnecting, state.Starting},
@@ -48,8 +50,6 @@ func TestTransition(t *testing.T) {
 		{"Disconnected to Stopping", state.Disconnected, state.Stopping},
 		{"Disconnected to Disconnected", state.Disconnected, state.Disconnected},
 		{"Starting to Starting", state.Starting, state.Starting},
-		{"Starting to Reconnecting", state.Starting, state.Reconnecting},
-		{"Starting to Stopping", state.Starting, state.Stopping},
 		{"Starting to Disconnected", state.Starting, state.Disconnected},
 		{"Connected to Connected", state.Connected, state.Connected},
 		{"Connected to Starting", state.Connected, state.Starting},
@@ -79,7 +79,7 @@ func TestTransition(t *testing.T) {
 	}
 }
 
-func TestServiceStateString(t *testing.T) {
+func TestServiceState_String(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
