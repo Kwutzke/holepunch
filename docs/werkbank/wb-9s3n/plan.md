@@ -48,7 +48,12 @@ The design is `docs/werkbank/wb-9s3n/design.md`. Its box 10 holds the acceptance
     {
       "title": "the ASG bastion, tray and resolver work lands with its laconic findings resolved",
       "reason": "",
-      "merge_blocking": false
+      "merge_blocking": false,
+      "subtasks": [
+        {"title": "the uncommitted ASG bastion, tray, resolver and session-error work from the main checkout is carried into the slice worktree unchanged, tracked and untracked files alike", "check": "a diff of the worktree against the main checkout's working tree over the carried files is empty, and the build and vet both exit 0"},
+        {"title": "the tray-register stream test no longer races the Up call: events are published only after the subscription is registered", "check": "the tray-register streaming test passes 50 consecutive runs under the race detector, and the full suite passes under the race detector"},
+        {"title": "every laconic gate finding in the carried files is fixed, and each warn finding is either fixed or kept with a laconic:ignore reason", "check": "laconic over the branch's changed files reports zero gate findings and no unexplained warn findings, and the full suite still passes under the race detector"}
+      ]
     },
     {
       "title": "tunnels recover from sleep and network changes, retry failed starts, leave no plugin behind and keep a log",
