@@ -8,25 +8,11 @@ import (
 	"github.com/Kwutzke/holepunch/internal/engine"
 )
 
-// notifyDedupeWindow suppresses repeat notifications for the same
-// (profile, aws profile) pair within this window — a profile with many
-// services would otherwise fire one OS-level notification per service on
-// the same credential expiry.
+// A profile with many services reports the same credential expiry once per service.
 const notifyDedupeWindow = 30 * time.Second
 
-// osascriptFunc is injected for testing. It is called with the message text.
-// Production uses the platform-specific implementation in notifier_darwin.go;
-// other platforms use a no-op.
-type osascriptFunc func(ctx context.Context, title, message string) error
-
-// trayPresentFunc reports whether a tray client is currently registered
-// with the daemon. When true, the notifier suppresses its own fallback
-// notification since the tray will surface the event itself.
-type trayPresentFunc func() bool
-
-// Notifier subscribes to engine events via the bus and fires a native
-// OS-level notification on CredentialsExpired. It exists so the user sees
-// something actionable without having to open `holepunch logs -f`.
+// Notifier posts a desktop notification on CredentialsExpired. It stays silent while a tray
+// client is connected, because the tray shows the expiry and a login item in its menu.
 type Notifier struct {
 	bus         *Bus
 	runFn       osascriptFunc
@@ -37,10 +23,7 @@ type Notifier struct {
 	lastFire map[string]time.Time
 }
 
-// NewNotifier starts a notifier goroutine subscribed to the given bus.
-// trayPresent is consulted on each CredentialsExpired: if it returns true,
-// the fallback osascript is skipped (the tray handles it). May be nil for
-// "always fire" behavior (used in tests).
+// NewNotifier notifies unconditionally when trayPresent is nil.
 func NewNotifier(bus *Bus, trayPresent trayPresentFunc) *Notifier {
 	n := &Notifier{
 		bus:         bus,
@@ -50,19 +33,20 @@ func NewNotifier(bus *Bus, trayPresent trayPresentFunc) *Notifier {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
-	go n.run(ctx)
+	events, unsub := bus.Subscribe()
+	go n.run(ctx, events, unsub)
 	return n
 }
 
-// Stop terminates the notifier's event loop.
 func (n *Notifier) Stop() {
 	if n.cancel != nil {
 		n.cancel()
 	}
 }
 
-func (n *Notifier) run(ctx context.Context) {
-	events, unsub := n.bus.Subscribe()
+// run takes a subscription made before the goroutine starts, so no event published after
+// NewNotifier returns is missed.
+func (n *Notifier) run(ctx context.Context, events <-chan engine.Event, unsub func()) {
 	defer unsub()
 
 	for {
@@ -100,3 +84,7 @@ func (n *Notifier) shouldFire(ce engine.CredentialsExpired) bool {
 	n.lastFire[key] = now
 	return true
 }
+
+type osascriptFunc func(ctx context.Context, title, message string) error
+
+type trayPresentFunc func() bool
